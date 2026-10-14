@@ -1,5 +1,5 @@
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ChatMessage, CliToolStatus, EffortLevel } from "../../../packages/shared/types";
@@ -7,11 +7,11 @@ import { getModelOptions, getUsageFor } from "./usage";
 import { validatePlan } from "./security";
 import { secureAgentArgs } from "./execution-policy";
 import { runCommand } from "./process";
+import { providerAdapters } from "./providers";
+import type { ProviderId } from "../../../packages/shared/providers";
 import { getApiProviderConfig, runApiProvider, type ApiProviderConfig } from "./apiProviders";
 
 const plannerTimeoutMs = 60_000;
-const claudeTimeoutMs = 60_000;
-const statusTimeoutMs = 6_000;
 const loggedOutOverrides = new Set<PlannerId>();
 
 // "claude" | "codex" | "antigravity" bilinen CLI'lar; ek olarak UI/.env'den gelen API
@@ -113,14 +113,6 @@ export async function runPlannerChat(
     } catch (error) {
       const rawOutput = error instanceof Error ? error.message : String(error);
       const output = cleanPlannerOutput(rawOutput);
-      if (output !== rawOutput && !output.includes("thread.started")) {
-        return {
-          planner,
-          modelLabel: modelLabel(planner),
-          output,
-          usedFallback: planner !== preferred && preferred !== "auto"
-        };
-      }
       errors.push(`${label(planner)}: ${plannerErrorOutput(planner, output)}`);
     }
   }
@@ -148,14 +140,6 @@ async function runSinglePlanner(planner: PlannerId, message: string, history: Ch
   } catch (error) {
     const rawOutput = error instanceof Error ? error.message : String(error);
     const output = cleanPlannerOutput(rawOutput);
-    if (output !== rawOutput && !output.includes("thread.started")) {
-      return {
-        planner,
-        modelLabel: labelText,
-        output,
-        usedFallback: false
-      };
-    }
     return {
       planner,
       modelLabel: labelText,
@@ -346,7 +330,11 @@ export async function getCliStatuses(): Promise<CliToolStatus[]> {
 // model listesi ekler.
 async function enrichWithUsage(status: CliToolStatus): Promise<CliToolStatus> {
   const usage = await getUsageFor(status.id);
-  const modelOptions = await getModelOptions(status.id, usage);
+  const modelOptions = status.providerProbe
+    ? status.providerProbe.models.length
+      ? status.providerProbe.models.map((model) => ({ id: model.id, label: model.label, limited: usage?.limited ?? false }))
+      : [{ id: "default", label: "Provider default (catalog unavailable)", limited: usage?.limited ?? false }]
+    : await getModelOptions(status.id, usage);
   return {
     ...status,
     usage,
@@ -477,14 +465,14 @@ export function startLoginCli(id: PlannerId) {
   if (process.platform === "win32") {
     if (id === "antigravity") {
       // `start ""` ile YENİ GÖRÜNÜR PowerShell penceresi aç (doğrudan spawn pencere açmıyordu).
-      spawn("cmd.exe", ["/d", "/c", "start", "", "powershell.exe", "-NoExit", "-Command", "agy login"], {
+      spawn("cmd.exe", ["/d", "/c", "start", "", "powershell.exe", "-NoExit", "-Command", "agy"], {
         detached: true,
         stdio: "ignore",
         windowsHide: false
       }).unref();
       return {
         ok: true,
-        message: `${label(id)} login komutu yeni bir PowerShell terminalinde baslatildi: agy login`
+        message: `${label(id)} login komutu yeni bir PowerShell terminalinde baslatildi: agy`
       };
     }
     spawn("cmd.exe", ["/d", "/c", "start", "", "cmd.exe", "/d", "/k", command], {
@@ -535,104 +523,6 @@ function agyExecutablePath() {
   return existsSync(agyExe) ? agyExe : undefined;
 }
 
-// Sadece auth durumunu loglardan okur (kurulu tespiti ayrı: agyInstalledByFile).
-function getAgyLogStatus() {
-  const logPath = join(userHome(), ".gemini", "antigravity-cli", "cli.log");
-  if (!existsSync(logPath)) return { authenticated: false };
-  try {
-    const log = readFileSync(logPath, "utf8");
-    // Auth başarı işareti. NOT: login sırasında token alınmadan önce log'a geçici
-    // "You are not logged into Antigravity" handshake HATALARI düşüyor — bunlar logout
-    // DEĞİL, o yüzden sayılmaz. UI üzerinden logout'u zaten loggedOutOverrides tutuyor.
-    const authenticated = /OAuth:\s+authenticated successfully|authenticated via keyring|Auth done received|silent auth succeeded/i.test(log);
-    return { authenticated };
-  } catch {
-    return { authenticated: false };
-  }
-}
-
-// agy GERÇEKTEN kurulu mu? Bilinen dosya konumlarına bakar (PATH fallback değil).
-function agyInstalledByFile(): boolean {
-  if (agyExecutablePath()) return true;
-  // Linux/macOS: also try resolving via `which` as last resort
-  if (process.platform !== "win32") {
-    try {
-      const result = execFileSync("which", ["agy"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-      if (result && existsSync(result)) return true;
-    } catch { /* not in PATH */ }
-    return false;
-  }
-  const agyBin = join(userHome(), "AppData", "Local", "agy", "bin");
-  if (existsSync(agyBin)) return true;
-  const npmDir = join(process.env.APPDATA ?? join(userHome(), "AppData", "Roaming"), "npm");
-  if (existsSync(join(npmDir, "agy.cmd")) || existsSync(join(npmDir, "agy.exe"))) return true;
-  return false;
-}
-
-// Tüm agy transcript.jsonl dosyalarını mtime'larıyla listeler.
-function listAgyTranscripts(): { path: string; mtimeMs: number }[] {
-  const brainDir = join(userHome(), ".gemini", "antigravity-cli", "brain");
-  if (!existsSync(brainDir)) return [];
-  try {
-    return readdirSync(brainDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => join(brainDir, entry.name, ".system_generated", "logs", "transcript.jsonl"))
-      .filter((path) => existsSync(path))
-      .map((path) => ({ path, mtimeMs: statSync(path).mtimeMs }));
-  } catch {
-    return [];
-  }
-}
-
-// Çalıştırma öncesi transcript mtime'larının anlık görüntüsü.
-function snapshotAgyTranscripts(): Map<string, number> {
-  return new Map(listAgyTranscripts().map((t) => [t.path, t.mtimeMs]));
-}
-
-// `before`'a göre YENİ ya da DEĞİŞEN transcript'i bulur, son MODEL içeriğini döndürür.
-function readNewestAgyResponse(before: Map<string, number>): string | undefined {
-  const changed = listAgyTranscripts()
-    .filter((t) => {
-      const prev = before.get(t.path);
-      return prev === undefined || t.mtimeMs > prev;
-    })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
-  for (const t of changed) {
-    const r = readLastModelContent(t.path);
-    if (r) return r;
-  }
-  return undefined;
-}
-
-// Transcript'teki MODEL'in gerçek metin cevabını döndürür.
-// Cevap `type:"PLANNER_RESPONSE"` (boş olmayan) entry'sindedir; GENERIC/RUN_COMMAND/VIEW_FILE/
-// CODE_ACTION gibi araç tipleri "Created At: …" metadata içerir, onları atla. En SONdakini al.
-function readLastModelContent(path: string): string | undefined {
-  let lines: string[];
-  try {
-    lines = readFileSync(path, "utf8").trim().split(/\r?\n/).reverse();
-  } catch {
-    return undefined;
-  }
-  let fallback: string | undefined;
-  for (const line of lines) {
-    try {
-      const parsed = JSON.parse(line) as { source?: string; type?: string; content?: string };
-      if (parsed.source !== "MODEL") continue;
-      const content = parsed.content?.trim();
-      if (!content) continue;
-      if (parsed.type === "PLANNER_RESPONSE" && !/^Created At:/.test(content)) {
-        return content; // gerçek model cevabı
-      }
-      // metadata değilse yedek olarak tut
-      if (!fallback && !/^Created At:/.test(content)) fallback = content;
-    } catch {
-      // Ignore partial or non-JSON transcript lines.
-    }
-  }
-  return fallback;
-}
-
 // agy sohbet/analiz çağrıları için boş, nötr bir çalışma dizini (repo'yu görmesin).
 let neutralCwdCache: string | undefined;
 function neutralAgyCwd() {
@@ -652,52 +542,33 @@ let claudeQueue: Promise<unknown> = Promise.resolve();
 
 // Bir planner'a HAZIR bir prompt gonderir. Sohbet akisi prompt'u buildPlannerPrompt/
 // buildClaudePrompt ile kurar; Tartisma modu ise kendi debate prompt'unu kurup buraya verir.
-async function callPlannerRaw(id: PlannerId, prompt: string, model?: string, effort?: EffortLevel): Promise<string> {
+export async function callPlannerRaw(id: PlannerId, prompt: string, model?: string, effort?: EffortLevel): Promise<string> {
   // API sağlayıcı katılımcısı → CLI yerine HTTP ile çalıştır (OpenRouter/Ollama/OpenAI-uyumlu…).
   if (isApiProviderId(id)) {
     const config = await resolveApiConfig(id, model);
     if (!config) throw new Error(`API sağlayıcı yapılandırılmamış: ${id}`);
     return runApiProvider(config, prompt);
   }
-  if (id === "claude") {
-    const run = claudeQueue.then(() => runClaude(prompt, model, effort), () => runClaude(prompt, model, effort));
+  if (id === "claude" || id === "codex" || id === "gemini" || id === "antigravity") {
+    const provider = id as ProviderId;
+    const execute = async () => {
+      const scratch = provider === "antigravity" ? mkdtempSync(join(tmpdir(), "orkestra-agy-chat-")) : undefined;
+      const cwd = scratch ?? neutralAgyCwd();
+      if (!cwd) throw new Error("Managed chat workspace unavailable");
+      try {
+        const result = await providerAdapters[provider].run({
+          configuration: { provider, model: model && model !== "default" ? model : undefined, effort, role: "planner", skills: [], permission: provider === "antigravity" ? "workspace-write" : "read-only", subagents: { enabled: false, maxConcurrent: 0 } },
+          cwd, prompt, timeoutMs: plannerTimeoutMs, onEvent: () => {},
+        });
+        return result.output;
+      } finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
+    };
+    if (id !== "claude") return execute();
+    const run = claudeQueue.then(execute, execute);
     claudeQueue = run.then(() => undefined, () => undefined);
     return run;
   }
-  if (id === "antigravity") {
-    // agy `-p <prompt>` cevabı STDOUT'a değil bir transcript dosyasına yazar; bu yüzden
-    // çıktıyı transcript'ten okuruz. Prompt agy.exe'ye doğrudan (cmd.exe'siz) argüman olarak
-    // gider, çok satırlı/uzun (≤32K) güvenle taşınır. `-p`'yi argümansız bırakmak HATA verir.
-    const args = model && model !== "default" ? ["--model", model, "-p", prompt] : ["-p", prompt];
-    // Saat karşılaştırması yerine: çalıştırma ÖNCESİ transcript mtime'larını al; sonra
-    // YENİ ya da DEĞİŞEN transcript'i bul. Deterministik (clock skew/pencere sorunu yok).
-    const before = snapshotAgyTranscripts();
-    // Sohbet/tartışma/analiz çağrıları NÖTR bir dizinde çalışır: agy repo dosyalarını görüp
-    // prompt'u "ajan görevi" sanmasın (araç kullanımı/dosya keşfi → temiz metin cevabı vermez).
-    return runTool("agy", args, "", plannerTimeoutMs, neutralAgyCwd())
-      .then(async (output) => {
-        const stdout = output.trim();
-        if (stdout && !/Usage of agy|flag needs an argument|Available subcommands/i.test(stdout)) return stdout;
-        const transcript = await waitForTranscript(() => readNewestAgyResponse(before), 25_000);
-        return transcript || "Antigravity cevap üretemedi (transcript bulunamadı).";
-      })
-      .catch(async (error) => {
-        const transcript = await waitForTranscript(() => readNewestAgyResponse(before), 25_000);
-        if (transcript) return transcript;
-        throw error;
-      });
-  }
-  const effortArgs = effort ? ["-c", `model_reasoning_effort="${effort}"`] : [];
-  const modelArgs = model && model !== "default" ? ["-m", model] : [];
-  return runTool("codex", ["exec", "--ephemeral", "--json", ...effortArgs, ...modelArgs, "-"], prompt, plannerTimeoutMs);
-}
-
-// Claude'u headless `-p` modunda calistirir. Prompt stdin'den verilir: Windows'ta
-// cmd.exe cok satirli argumani ilk satirda keser; stdin guvenle tasir.
-async function runClaude(prompt: string, model?: string, effort?: EffortLevel) {
-  const modelArgs = model && model !== "default" ? ["--model", model] : [];
-  const args = ["-p", "--effort", effort ?? "low", ...modelArgs];
-  return runTool("claude", args, prompt, claudeTimeoutMs);
+  throw new Error(`Unknown planner provider: ${id}`);
 }
 
 // Kullanıcının mesaj dilini tespit eder (EN/TR) — yanıtın AYNI dilde olması için.
@@ -733,16 +604,6 @@ async function buildClaudePrompt(message: string, history: ChatMessage[], detail
   ].join("\n");
 }
 
-async function waitForTranscript(read: () => string | undefined, timeoutMs: number) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = read();
-    if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  return read();
-}
-
 function loginCommand(id: PlannerId) {
   if (process.platform !== "win32") {
     if (id === "codex") return "codex login";
@@ -756,7 +617,7 @@ function loginCommand(id: PlannerId) {
   if (id === "codex") {
     return "codex login";
   }
-  return "agy login";
+  return "agy";
 }
 
 async function callPlanner(id: PlannerId, message: string, history: ChatMessage[], model?: string, effort?: EffortLevel, detailLevel?: "low" | "medium" | "high", preHistory?: string) {
@@ -1102,110 +963,23 @@ async function statusFor(id: PlannerId) {
   return await enrichWithUsage(base);
 }
 
-async function getClaudeStatus(): Promise<CliToolStatus> {
-  try {
-    const output = await runTool("claude", ["auth", "status"], "", statusTimeoutMs);
-    const lower = output.toLowerCase();
-    const parsed = safeJsonParse<{ loggedIn?: boolean; authMethod?: string; apiKeySource?: string }>(output);
-    const apiKeyOnly = parsed?.authMethod === "api_key";
-    const hasClaudeAccount = parsed?.authMethod === "claude.ai";
-    if (hasClaudeAccount && parsed?.loggedIn) loggedOutOverrides.delete("claude");
-    const authenticated = loggedOutOverrides.has("claude")
-      ? false
-      : typeof parsed?.loggedIn === "boolean"
-      ? parsed.loggedIn && !apiKeyOnly
-      : lower.includes("authenticated") || lower.includes("logged in") || lower.includes("loggedin: true");
-    return {
-      id: "claude",
-      name: "Claude Code CLI",
-      installed: true,
-      authenticated,
-      quotaOk: !isQuotaError(output),
-      responding: false,
-      models: ["default"],
-      limits: defaultLimitPatterns(),
-      lastError: authenticated ? undefined : "Giriş gerekli."
-    };
-  } catch (error) {
-    return statusError("claude", "Claude Code CLI", error);
-  }
-}
-
-async function getCodexStatus(): Promise<CliToolStatus> {
-  try {
-    const output = await runTool("codex", ["login", "status"], "", statusTimeoutMs);
-    const authPath = join(userHome(), ".codex", "auth.json");
-    const authJson = existsSync(authPath) ? readFileSync(authPath, "utf8") : "";
-    const hasToken = /"tokens"\s*:|"OPENAI_API_KEY"\s*:\s*"/.test(authJson);
-    const badAuth = /not logged in|not authenticated|giriş yapılmadı|oturum açılmadı/i.test(output);
-    return {
-      id: "codex",
-      name: "Codex CLI",
-      installed: true,
-      authenticated: !loggedOutOverrides.has("codex") && (hasToken || /logged in/i.test(output)) && !badAuth,
-      quotaOk: !isQuotaError(output),
-      responding: false,
-      models: ["default"],
-      limits: defaultLimitPatterns(),
-      lastError: badAuth ? "Codex oturumu gecersiz gorunuyor. codex login gerekli." : undefined
-    };
-  } catch (error) {
-    const authPath = join(userHome(), ".codex", "auth.json");
-    const authJson = existsSync(authPath) ? readFileSync(authPath, "utf8") : "";
-    const hasToken = /"tokens"\s*:|"OPENAI_API_KEY"\s*:\s*"/.test(authJson);
-    if (hasToken) {
-      return {
-        id: "codex",
-        name: "Codex CLI",
-        installed: true,
-        authenticated: !loggedOutOverrides.has("codex"),
-        quotaOk: true,
-        responding: false,
-        models: modelsFor("codex"),
-        limits: defaultLimitPatterns(),
-        lastError: "Auth dosyası var; Codex CLI login status yenileme istiyor."
-      };
-    }
-    return statusError("codex", "Codex CLI", error);
-  }
-}
-
-async function getAntigravityStatus(): Promise<CliToolStatus> {
-  // KURULU tespiti yalnızca gerçek agy dosya konumlarına dayanır. agy yoksa resolveTool
-  // `cmd /c agy`'ye düşüyor; cmd başarıyla çalıştığı için "not recognized" hatası SADECE
-  // çıktıda kalıyordu ve eskiden yanlışlıkla installed:true dönüyordu. Artık dosya yoksa
-  // kurulu değildir.
-  const installed = agyInstalledByFile();
-  if (!installed) {
-    return {
-      id: "antigravity",
-      name: "Antigravity CLI",
-      installed: false,
-      authenticated: false,
-      quotaOk: true,
-      responding: false,
-      models: modelsFor("antigravity"),
-      limits: defaultLimitPatterns(),
-      lastError: "Kurulu değil."
-    };
-  }
-  const agyLogStatus = getAgyLogStatus();
-  const authenticated = !loggedOutOverrides.has("antigravity") && agyLogStatus.authenticated;
+async function getNativeStatus(id: "claude" | "codex" | "antigravity"): Promise<CliToolStatus> {
+  const probe = await providerAdapters[id].probe();
+  const authenticated = probe.authentication === "authenticated" && probe.authenticationMethod !== "api" && !probe.error && !(id === "antigravity" && loggedOutOverrides.has(id));
+  if (authenticated) loggedOutOverrides.delete(id);
   return {
-    id: "antigravity",
-    name: "Antigravity CLI",
-    installed: true,
-    authenticated,
-    quotaOk: true,
-    responding: false,
-    models: modelsFor("antigravity"),
-    limits: defaultLimitPatterns(),
-    lastError: authenticated ? undefined : "Giriş gerekli.",
-    hint: authenticated
-      ? "Antigravity OAuth oturumu logdan doğrulandı."
-      : "Antigravity CLI kurulu; agy login gerekli."
+    id, name: id === "claude" ? "Claude Code CLI" : id === "antigravity" ? "Antigravity CLI" : "Codex CLI",
+    installed: probe.installed, authenticated,
+    quotaOk: probe.error?.kind !== "quota" && probe.error?.kind !== "rate_limit", responding: false,
+    models: probe.models.map((model) => model.id), limits: defaultLimitPatterns(),
+    lastError: probe.error?.message ?? (authenticated ? undefined : "Account login required."),
+    providerProbe: probe,
   };
 }
+function getClaudeStatus() { return getNativeStatus("claude"); }
+function getCodexStatus() { return getNativeStatus("codex"); }
+
+function getAntigravityStatus() { return getNativeStatus("antigravity"); }
 
 function statusError(id: PlannerId, name: string, error: unknown): CliToolStatus {
   const message = normalizeCliError(id, error instanceof Error ? error.message : String(error), false);

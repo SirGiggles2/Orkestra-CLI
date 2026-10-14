@@ -5,9 +5,10 @@ import { applyStaging, createStaging, discardStaging, findStaging, sealStaging, 
 import type { Store } from "./db";
 import type { EventHub } from "./events";
 import { getApiProviderConfig, runApiProvider, type ApiProviderConfig } from "./apiProviders";
-import { agentEnvironment, canonicalPath, containedTaskPath, pathWithin, validatePlan } from "./security";
-import { spawnCommand, killProcessTree, structuredFailure } from "./process";
-import { executionPermission, secureAgentArgs } from "./execution-policy";
+import { canonicalPath, containedTaskPath, pathWithin, validatePlan } from "./security";
+import { spawnCommand, killProcessTree } from "./process";
+import { executionPermission } from "./execution-policy";
+import { providerAdapters, configurationFromAgent } from "./providers";
 
 // Ajan başına yürütme zaman aşımı (saniye). Gerçek kodlama görevleri 5 dk'yı kolayca aşar;
 // varsayılan 30 dk. ORKESTRA_AGENT_TIMEOUT_SECONDS ile değiştirilebilir.
@@ -667,97 +668,33 @@ export class Runner {
       return this.runApiAgent(agent, run, transcript, notes, opts);
     }
 
-    const cleanEnv = agentEnvironment();
-    const args = secureAgentArgs(agent, executionPermission(run));
-
-    return new Promise<string>((resolve, reject) => {
-      if (executionPermission(run) === "workspace-write") mkdirSync(cwd, { recursive: true });
-      else if (!existsSync(cwd)) throw new Error("Read-only task folder must already exist");
-
-      let lastSnapshot = snapshotWorkspace(cwd);
-      const reportFileChanges = () => {
-        const nextSnapshot = snapshotWorkspace(cwd);
-        for (const change of diffSnapshots(lastSnapshot, nextSnapshot)) {
-          this.emit(
-            run.id,
-            change.type,
-            change.path,
-            agent.id,
-            JSON.stringify({ path: change.path, adds: change.adds, dels: change.dels })
-          );
-        }
-        lastSnapshot = nextSnapshot;
-      };
-      const promptText = opts?.promptText ?? buildAgentPrompt(run.prompt, agent, transcript, notes);
-      const child = spawnCommand(agent.command, args, {
-        cwd,
-        env: cleanEnv
-      });
-      const fileWatch = setInterval(reportFileChanges, 1000);
+    const permission = executionPermission(run);
+    const configuration = configurationFromAgent(agent, permission);
+    if (permission === "workspace-write") mkdirSync(cwd, { recursive: true });
+    else if (!existsSync(cwd)) throw new Error("Read-only task folder must already exist");
+    let snapshot = snapshotWorkspace(cwd);
+    const reportChanges = () => {
       try {
-        child.stdin?.end(promptText);
-      } catch {
-        // stdin yazılamazsa süreç zaten başlamamış olabilir
-      }
-      const control = this.controls.get(run.id);
-      if (control) control.children.add(child);
-
-      let output = "";
-      let timedOut = false;
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        void killProcessTree(child).catch((error) => {
-          clearInterval(fileWatch);
-          reject(error);
-        });
-      }, agent.timeoutSeconds * 1000);
-
-      child.stdout.on("data", (chunk: Buffer) => {
-        const text = chunk.toString();
-        output += text;
-        this.emit(run.id, "stdout", text, agent.id, text);
-        reportFileChanges();
-        this.checkLimit(agent, run.id, text);
-      });
-
-      child.stderr.on("data", (chunk: Buffer) => {
-        const text = chunk.toString();
-        output += text;
-        this.emit(run.id, "stderr", text, agent.id, text);
-        reportFileChanges();
-        this.checkLimit(agent, run.id, text);
-      });
-
-      child.on("error", (error) => {
-        clearTimeout(timeout);
-        clearInterval(fileWatch);
-        control?.children.delete(child);
-        this.store.setAgentStatus(agent.id, "available");
-        reject(error);
-      });
-
-      child.on("close", (code) => {
-        clearTimeout(timeout);
-        clearInterval(fileWatch);
-        control?.children.delete(child);
-        reportFileChanges();
-        const current = this.store.getAgent(agent.id);
-        if (current?.status !== "limited") this.store.setAgentStatus(agent.id, "available");
-
-        if (timedOut) {
-          reject(new Error(`${agent.name} timed out after ${agent.timeoutSeconds}s.`));
-        } else if (control?.stop) {
-          reject(new Error("Run canceled"));
-        } else if (code === 0 && structuredFailure(output)) {
-          reject(new Error(structuredFailure(output)));
-        } else if (code === 0) {
-          this.emit(run.id, "completed", `${agent.name} completed.`, agent.id);
-          resolve(output.trim() || "(no output)");
-        } else {
-          reject(new Error(`${agent.name} exited with code ${code}.`));
-        }
-      });
-    });
+        const next = snapshotWorkspace(cwd);
+        for (const change of diffSnapshots(snapshot, next)) this.emit(run.id, change.type, change.path, agent.id, JSON.stringify(change));
+        snapshot = next;
+      } catch { this.emit(run.id, "agent_step", "Workspace change scan unavailable", agent.id); }
+    };
+    const controller = new AbortController();
+    const control = this.controls.get(run.id);
+    if (control) (control.aborters ??= new Set()).add(controller);
+    if (control?.stop) controller.abort();
+    const fileWatch = setInterval(reportChanges, 1000);
+    return providerAdapters[configuration.provider].run({
+      configuration, cwd, prompt: opts?.promptText ?? buildAgentPrompt(run.prompt, agent, transcript, notes),
+      timeoutMs: agent.timeoutSeconds * 1000, signal: controller.signal,
+      onEvent: (event) => {
+        this.emit(run.id, "provider_event", event.type, agent.id, JSON.stringify(event));
+        if (event.type === "text") this.emit(run.id, "stdout", event.text, agent.id, event.text);
+        if (event.type === "error") this.checkLimit(agent, run.id, event.message);
+        if (event.type === "tool") this.emit(run.id, "agent_step", event.name + ": " + event.status, agent.id);
+      },
+    }).then((result) => result.output).finally(() => { clearInterval(fileWatch); reportChanges(); control?.aborters?.delete(controller); });
   }
 
   private async runDryAgent(agent: Agent, run: Run, transcript: string) {

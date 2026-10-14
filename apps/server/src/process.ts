@@ -15,6 +15,11 @@ export function resolveCommand(command: string): { executable: string; prefixArg
     if (candidate.toLowerCase().endsWith(".exe")) return { executable: candidate, prefixArgs: [] };
     if (candidate.toLowerCase().endsWith(".cmd")) {
       const shim = readFileSync(candidate, "utf8");
+      const nativeMatch = shim.match(/%dp0%\\(node_modules\\[^"\r\n]+\.exe)/i);
+      if (nativeMatch) {
+        const executable = resolve(dirname(candidate), nativeMatch[1]);
+        if (existsSync(executable)) return { executable, prefixArgs: [] };
+      }
       const match = shim.match(/%dp0%\\([^"\r\n]+\.(?:js|mjs|cjs))/i);
       if (match) {
         const script = resolve(dirname(candidate), match[1]);
@@ -60,10 +65,14 @@ export async function killProcessTree(child?: ChildProcess): Promise<void> {
   }
 }
 
-export function runCommand(command: string, args: string[], input: string, timeoutMs: number, cwd?: string): Promise<string> {
+export function runCommand(command: string, args: string[], input: string, timeoutMs: number, cwd?: string, signal?: AbortSignal): Promise<string> {
   return new Promise((resolveResult, reject) => {
+    if (signal?.aborted) { reject(new Error(`${command} canceled`)); return; }
     const child = spawnCommand(command, args, { cwd });
-    let output = "", timedOut = false, overflow = false;
+    let output = "", timedOut = false, overflow = false, canceled = false;
+    const onAbort = () => { canceled = true; void killProcessTree(child).catch(reject); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); };
     const timer = setTimeout(() => { timedOut = true; void killProcessTree(child).catch(reject); }, timeoutMs);
     const collect = (chunk: Buffer) => {
       if (overflow) return;
@@ -71,10 +80,11 @@ export function runCommand(command: string, args: string[], input: string, timeo
       if (Buffer.byteLength(output) > 5 * 1024 * 1024) { overflow = true; void killProcessTree(child).catch(reject); }
     };
     child.stdout.on("data", collect); child.stderr.on("data", collect);
-    child.on("error", (error) => { clearTimeout(timer); reject(error); });
+    child.on("error", (error) => { cleanup(); reject(error); });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) reject(new Error(`${command} timed out; process tree terminated`));
+      cleanup();
+      if (canceled) reject(new Error(`${command} canceled; process tree terminated`));
+      else if (timedOut) reject(new Error(`${command} timed out; process tree terminated`));
       else if (overflow) reject(new Error("CLI output limit exceeded"));
       else if (code !== 0) reject(new Error(output.trim() || `${command} exited with code ${code}`));
       else if (structuredFailure(output)) reject(new Error(structuredFailure(output)));
