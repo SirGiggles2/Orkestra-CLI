@@ -21,7 +21,7 @@ import { Store, defaultLimitPatterns } from "./db";
 import { EventHub } from "./events";
 import { Runner } from "./runner";
 import { pathWithin, validatePlan, containedTaskPath } from "./security";
-import { executionPermission, assertIsolatedWorker } from "./execution-policy";
+import { executionPermission } from "./execution-policy";
 import { localOriginAllowed, localHostAllowed } from "./http-policy";
 import { GitService } from "./git";
 import { GitHubStore, getUser, createRepo, createPr, parseGitHubRemote, deviceStart, devicePoll } from "./github";
@@ -104,7 +104,7 @@ type TerminalSession = {
 const terminalSessions = new Map<string, TerminalSession>();
 const maxTerminalBuffer = 240_000;
 
-app.get("/api/health", async () => ({ ok: true, execution: { defaultPermission: "read-only", isolatedWorkerConfigured: process.env.ORKESTRA_ISOLATED_WORKER === "1", remoteEnabled: false } }));
+app.get("/api/health", async () => ({ ok: true, execution: { defaultPermission: "read-only", workerIdentity: "current-account", isolation: "provider-native", remoteEnabled: false } }));
 
 // Eki tanımlar: görselse yolu ver (CLI okur), metin/kod dosyasıysa içeriğini prompt'a göm.
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"]);
@@ -618,7 +618,6 @@ app.post<{ Body: CreateRunRequest }>("/api/runs", async (request, reply) => {
 
   try {
     runner.assertWorkspaceAvailable(workspacePath);
-    if (executionPermission(request.body) === "workspace-write") assertIsolatedWorker();
     for (const task of request.body.tasks ?? []) containedTaskPath(workspacePath, task.folder);
   } catch (error) { return reply.code(409).send({ error: (error as Error).message }); }
 

@@ -11,7 +11,7 @@ const port = 18987;
 let child;
 const start = async () => {
   child = spawn(process.execPath, ['--import', 'tsx', 'apps/server/src/index.ts'], {
-    env: { ...process.env, ORKESTRA_HOST: '127.0.0.1', ORKESTRA_PORT: String(port), ORKESTRA_DATA_DIR: join(root, 'data'), ORKESTRA_WORKSPACE_DIR: join(root, 'ws'), ORKESTRA_API_PROVIDERS: '', ORKESTRA_ISOLATED_WORKER: '0', ORKESTRA_ENABLE_LOCAL_TERMINAL: '0' },
+    env: { ...process.env, ORKESTRA_HOST: '127.0.0.1', ORKESTRA_PORT: String(port), ORKESTRA_DATA_DIR: join(root, 'data'), ORKESTRA_WORKSPACE_DIR: join(root, 'ws'), ORKESTRA_API_PROVIDERS: '', ORKESTRA_ENABLE_LOCAL_TERMINAL: '0' },
     stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
   });
   let log = ''; child.stdout.on('data', (b) => { log += b; }); child.stderr.on('data', (b) => { log += b; });
@@ -30,6 +30,9 @@ const stop = async () => {
 
 try {
   await start();
+  const health = await (await request('/api/health')).json();
+  assert.equal(health.execution.workerIdentity, 'current-account');
+  assert.equal(health.execution.isolation, 'provider-native');
   assert.equal((await request('/')).status, 200, 'built React app is served');
   assert.equal((await request('/api/health', undefined, { Origin: 'https://evil.example' })).status, 403);
   const hostileHostStatus = await new Promise((resolveStatus, reject) => {

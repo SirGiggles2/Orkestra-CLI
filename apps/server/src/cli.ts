@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import type { ChatMessage, CliToolStatus, EffortLevel } from "../../../packages/shared/types";
 import { getModelOptions, getUsageFor } from "./usage";
 import { validatePlan } from "./security";
-import { assertIsolatedWorker, secureAgentArgs } from "./execution-policy";
+import { secureAgentArgs } from "./execution-policy";
 import { runCommand } from "./process";
 import { getApiProviderConfig, runApiProvider, type ApiProviderConfig } from "./apiProviders";
 
@@ -1246,7 +1246,6 @@ function safeJsonParse<T>(value: string): T | undefined {
 
 function runTool(command: string, args: string[], input: string, timeoutMs = plannerTimeoutMs, cwd?: string) {
   if (input || args.includes("-p") || args.includes("exec")) {
-    assertIsolatedWorker();
     args = secureAgentArgs({ command, argsTemplate: args } as import("../../../packages/shared/types").Agent, "read-only");
   }
   return runCommand(command, args, input, timeoutMs, cwd);

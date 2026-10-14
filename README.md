@@ -267,7 +267,7 @@ Provider shortcuts cover native OpenAI, Anthropic, Gemini, Azure OpenAI, and Oll
 
 ## 🧩 Agent Command Mappings (Headless Parameters)
 
-Managed execution defaults to read-only and rejects permission-bypass templates. CLI runs require a provisioned restricted worker account or VM and explicit local configuration. Workspace writes require a staging worktree and a live, explicit diff approval. Gemini and Antigravity execution remain disabled pending separate capability-tested adapters.
+Managed execution uses the existing Windows account, defaults to read-only, and rejects permission-bypass templates. Provider-native sandbox/tool controls remain enforced; no VM or separate account is required. Workspace writes require a staging worktree and a live, explicit diff approval. Gemini and Antigravity execution remain disabled pending separate capability-tested adapters.
 
 See [PR-001 execution audit](docs/PR-001-execution-hardening.md) for tested behavior, supported configurations, and remaining limitations.
 

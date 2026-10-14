@@ -7,7 +7,7 @@ import type { EventHub } from "./events";
 import { getApiProviderConfig, runApiProvider, type ApiProviderConfig } from "./apiProviders";
 import { agentEnvironment, canonicalPath, containedTaskPath, pathWithin, validatePlan } from "./security";
 import { spawnCommand, killProcessTree, structuredFailure } from "./process";
-import { assertIsolatedWorker, executionPermission, secureAgentArgs } from "./execution-policy";
+import { executionPermission, secureAgentArgs } from "./execution-policy";
 
 // Ajan başına yürütme zaman aşımı (saniye). Gerçek kodlama görevleri 5 dk'yı kolayca aşar;
 // varsayılan 30 dk. ORKESTRA_AGENT_TIMEOUT_SECONDS ile değiştirilebilir.
@@ -98,7 +98,6 @@ export class Runner {
   private claimWorkspace(run: Run) {
     if (this.store.getRun(run.id)?.executionState !== "QUEUED") throw new Error("Only queued jobs may start; interrupted work requires reconciliation");
     executionPermission(run);
-    if (executionPermission(run) === "workspace-write") assertIsolatedWorker();
     this.assertWorkspaceAvailable(run.workspacePath);
     this.workspaceOwners.set(canonicalPath(run.workspacePath), run.id);
   }
@@ -668,7 +667,6 @@ export class Runner {
       return this.runApiAgent(agent, run, transcript, notes, opts);
     }
 
-    assertIsolatedWorker();
     const cleanEnv = agentEnvironment();
     const args = secureAgentArgs(agent, executionPermission(run));
 

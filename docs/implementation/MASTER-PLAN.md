@@ -1,5 +1,7 @@
 # ORKESTRA — MASTER IMPLEMENTATION PLAN
 
+> User amendment, 2026-10-14: Run the Windows worker under the existing Windows account. Do not require a VM or separate account. This overrides the account/VM prerequisite below; provider-native permissions, approvals, credential filtering and workspace checks remain part of the implementation.
+
 **Project:** Custom Orkestra Multi-Agent Development Command Center
 **Status:** Approved development direction
 **Starting point:** https://github.com/burakdemir16/Orkestra-CLI

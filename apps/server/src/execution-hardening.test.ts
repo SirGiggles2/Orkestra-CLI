@@ -8,7 +8,7 @@ import { Store } from "./db";
 import { EventHub } from "./events";
 import type { PlanTask, Run } from "../../../packages/shared/types";
 import { validatePlan, pathWithin, containedTaskPath, agentEnvironment } from "./security";
-import { executionPermission, secureAgentArgs, assertIsolatedWorker } from "./execution-policy";
+import { executionPermission, secureAgentArgs } from "./execution-policy";
 import { spawnCommand, killProcessTree, runCommand } from "./process";
 import { assertJobTransition } from "./job-state";
 import { once } from "node:events";
@@ -189,8 +189,6 @@ test("policy denies bypass templates, elevated permissions and writes without re
   assert.throws(() => executionPermission({ permission: "workspace-write", preWriteApproval: false }));
   assert.throws(() => secureAgentArgs({ ...agent, command: "gemini" }, "read-only"), /PR-002/);
   assert.throws(() => secureAgentArgs({ ...agent, command: "agy" }, "read-only"), /adapter/);
-  const previous = process.env.ORKESTRA_ISOLATED_WORKER; delete process.env.ORKESTRA_ISOLATED_WORKER;
-  try { assert.throws(assertIsolatedWorker, /restricted worker/); } finally { if (previous !== undefined) process.env.ORKESTRA_ISOLATED_WORKER = previous; }
 });
 
 test("non-idempotent failure is not retried or handed to a fallback", async () => {
@@ -268,13 +266,13 @@ test("failed task marks the entire job failed without starting its dependent", a
   assert.ok(!store.listEvents(run.id).some((e) => e.type === "completed"));
 });
 
-test("team result stays outside the project until explicit approval", { timeout: 10000 }, async () => {
+test("current-account team run needs no isolation flag and stays staged until approval", { timeout: 10000 }, async () => {
   const { runner, internal, store, run } = fixture();
   execFileSync("git", ["init", "-b", "main"], { cwd: run.workspacePath, stdio: "ignore" });
   execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@local", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "baseline"], { cwd: run.workspacePath, stdio: "ignore" });
   run.preWriteApproval = true;
   internal.runAgent = async (_agent: unknown, _run: Run, _transcript: string, _notes: unknown, opts: { cwd: string }) => { writeFileSync(join(opts.cwd, "result.txt"), "approved edit"); return "ok"; };
-  const previous = process.env.ORKESTRA_ISOLATED_WORKER; process.env.ORKESTRA_ISOLATED_WORKER = "1";
+  const previous = process.env.ORKESTRA_ISOLATED_WORKER; delete process.env.ORKESTRA_ISOLATED_WORKER;
   try {
     runner.startTeam(run, [{ id: "a", title: "Write result" }]);
     for (let i = 0; i < 100 && store.getRun(run.id)?.executionState !== "WAITING_FOR_APPROVAL"; i++) await new Promise((r) => setTimeout(r, 20));

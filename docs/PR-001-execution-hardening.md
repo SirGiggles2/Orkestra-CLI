@@ -2,6 +2,8 @@
 
 Date: 2026-10-14. Scope: the first implementation work order in [the approved master plan](implementation/MASTER-PLAN.md).
 
+User policy amendment (2026-10-14): use the existing Windows account. A VM or dedicated account is optional and is no longer an execution prerequisite. The checks below describe the current-account implementation and its limits.
+
 ## Foundation and baseline
 
 - Fork: https://github.com/SirGiggles2/Orkestra-CLI
@@ -54,7 +56,7 @@ Default run permission is `read-only`. No baseline commit, prompt, transcript or
 
 `preWriteApproval: true` requests `workspace-write`, unless an explicit contradictory permission is provided (rejected). Write runs require an existing clean Git repository with HEAD. Orkestra no longer silently commits the user's dirty project to create a baseline. Preserve/commit existing changes deliberately before requesting a write run.
 
-Managed CLI execution and write runs are disabled until an administrator provisions a restricted worker account or VM and explicitly sets `ORKESTRA_ISOLATED_WORKER=1`. **That setting is an assertion, not a verified sandbox.** Do not set it on an unrestricted personal account. The account/VM must enforce approved filesystem access and network policy, have only provider login material, and lack unrelated credentials. Provisioning and evidence of isolation are still outstanding.
+Managed CLI execution uses the existing Windows account with the provider-native controls described below. No separate account, VM or isolation assertion flag is required. `ORKESTRA_ISOLATED_WORKER` has been removed and has no effect. Read-only defaults, credential filtering, checked paths, denied escalation and staged write approval remain enforced. These controls do not create a separate OS security boundary around the whole provider process.
 
 | Provider | Current policy |
 | --- | --- |
@@ -89,11 +91,11 @@ Dependency repair: compatible locked updates plus `@fastify/static` 10.1.6 fix t
 
 ## Remaining security limitations / unsafe behaviors kept disabled
 
-1. **No provisioned OS isolation yet.** Flags, tools, path checks and worktrees cannot prevent all host-account access, junction races, inherited on-disk credentials, malicious project/Git configuration, provider hooks or unrestricted networking. Managed execution must stay disabled on the personal account. Dedicated worker provisioning and adversarial probes are required.
+1. **Current-account execution.** Per the user's explicit preference, there is no dedicated OS account or VM. Provider controls, path checks and worktrees cannot prevent all host-account access, junction races, on-disk credential access or malicious provider/project configuration. Native-control and adversarial probes are still required; the application must not claim full host isolation.
 2. **No authenticated remote API or worker.** Local clients with machine access can call the API; browser origin checks do not authenticate local processes. Do not reverse-proxy this version through Tailscale or expose it publicly. PR-003 adds authenticated control plane/worker and approved origins.
 3. **Single-process JSON store.** Atomic replacement and synchronous transitions do not provide SQLite transactions, power-loss fsync guarantees, multi-server exclusion, durable leases, idempotency or an append-only ledger. Recent output events can be lost in a crash; history retention is bounded. Restart fails closed, not automatic resumption.
 4. **Process lifetime limitations.** Taskkill reliably handles the tested live parent tree, but detached or already-orphaned processes require Windows Job Objects/isolated worker supervision. Denied taskkill is reported as a failure. Abrupt host death cannot run cleanup.
-5. **Staging is collaboration isolation.** External editors/processes and hostile agents can race checks; there is no cross-process project lease. Stale/dirty results are rejected when detected. Git commit/merge hooks are disabled for the staging Git runner, but external isolation is still required. Large/binary diff UI limits need approval UX work.
+5. **Staging is collaboration isolation.** External editors/processes and hostile agents can race checks; there is no cross-process project lease. Stale/dirty results are rejected when detected. Git commit/merge hooks are disabled for the staging Git runner. Optional external isolation can strengthen this boundary, but is not a prerequisite. Large/binary diff UI limits need approval UX work.
 6. **No native approval bridge, tool-level audit, permission broker or verified code acceptance.** Claude writes, Gemini and Antigravity stay disabled rather than simulating support. No automatic retries for write operations. Restarted pending work is retained for manual reconciliation.
 7. **Existing privileged features remain local.** Opted-in terminals, install commands, preview scripts and explicit GitHub routes use host privileges. Credential removal from agent processes does not secure those endpoints for remote use. API-provided base URLs and attachments need a dedicated remote threat review.
 
@@ -115,6 +117,6 @@ Dependency repair: compatible locked updates plus `@fastify/static` 10.1.6 fix t
 
 Implement the common typed adapter/event contract, capability probes, effective-config recording, structured provider errors and independent approval protocols. Use Codex App Server for approvals/session events and the Claude Agent SDK for an approval-capable bounded adapter. Probe installed Gemini headless support independently of Antigravity. Test subscription auth and model/effort behavior on disposable repos; do not claim unobserved features.
 
-Provision and verify the restricted execution identity/VM; exercise credential/network/path attacks and supervised process cancellation. Then build PR-003's SQLite job queue, authenticated outbound Windows worker, leases/idempotency/reconciliation and Unraid Docker configuration. Complete the harmless phone → NAS → Windows → phone milestone before advanced Auto, mobile redesign, Caveman or Superpowers integration.
+Use the existing Windows identity and exercise provider-native filesystem/network controls, credential filtering, approval behavior and supervised process cancellation. Then build PR-003's SQLite job queue, authenticated outbound Windows worker, leases/idempotency/reconciliation and Unraid Docker configuration. Complete the harmless phone → NAS → Windows → phone milestone before advanced Auto, mobile redesign, Caveman or Superpowers integration. A VM/dedicated account remains an optional future hardening choice.
 
 References used with local CLI help: [Codex execution reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli), [Codex security](https://learn.chatgpt.com/docs/security), [Claude CLI reference](https://code.claude.com/docs/en/cli-reference). These establish controls, not proof that a host is isolated.

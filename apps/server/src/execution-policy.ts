@@ -9,10 +9,6 @@ export function executionPermission(run: Pick<Run, "permission" | "preWriteAppro
   return permission;
 }
 
-export function assertIsolatedWorker() {
-  if (process.env.ORKESTRA_ISOLATED_WORKER !== "1") throw new Error("CLI execution disabled: provision a restricted worker account or VM, then set ORKESTRA_ISOLATED_WORKER=1. Worktrees are not a security sandbox.");
-}
-
 // Templates cannot override the policy. Only model and reasoning selections
 // are retained; arbitrary commands/config overrides fail closed.
 export function secureAgentArgs(agent: Agent, permission: ExecutionPermission): string[] {
