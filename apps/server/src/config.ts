@@ -25,13 +25,15 @@ export function loadDotEnv(file = ".env") {
 
 export function getConfig(): AppConfig {
   loadDotEnv();
+  const host = process.env.ORKESTRA_HOST ?? "127.0.0.1";
+  if (!["127.0.0.1", "::1", "localhost"].includes(host)) throw new Error("Remote binding disabled until authenticated control plane is implemented in PR-003");
   const dataDir = resolve(process.cwd(), process.env.ORKESTRA_DATA_DIR ?? "data");
   const workspaceDir = resolve(process.cwd(), process.env.ORKESTRA_WORKSPACE_DIR ?? "workspaces");
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(workspaceDir, { recursive: true });
 
   return {
-    host: process.env.ORKESTRA_HOST ?? "127.0.0.1",
+    host,
     port: Number(process.env.ORKESTRA_PORT ?? 8787),
     dataDir,
     workspaceDir

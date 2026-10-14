@@ -1,8 +1,9 @@
 import { execFile, execFile as execFileCb } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { DiffFile } from "./git";
+import { containedTaskPath, agentEnvironment } from "./security";
 
 const exec = promisify(execFileCb);
 
@@ -23,13 +24,14 @@ export type StagingSession = {
   branch: string;
   worktreePath: string;
   baseCommit: string;
+  reviewedCommit?: string;
 };
 
 export type GitRunner = (cwd: string, args: string[], stdin?: string) => Promise<{ stdout: string; code: number }>;
 
 const defaultGit: GitRunner = async (cwd, args) => {
   try {
-    const { stdout } = await exec("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await exec("git", ["-c", `core.hooksPath=${process.platform === "win32" ? "NUL" : "/dev/null"}`, ...args], { cwd, env: agentEnvironment(), windowsHide: true, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     return { stdout, code: 0 };
   } catch (e) {
     const err = e as { stdout?: string; code?: number };
@@ -42,7 +44,8 @@ export function branchName(phaseIndex: number): string {
 }
 
 export function worktreePathFor(stagingRoot: string, runId: string, phaseIndex: number): string {
-  return join(stagingRoot, runId, `phase-${phaseIndex}`);
+  if (!/^[a-zA-Z0-9_-]+$/.test(runId) || !Number.isSafeInteger(phaseIndex) || phaseIndex < 0) throw new Error("Invalid staging identity");
+  return containedTaskPath(stagingRoot, `${runId}/phase-${phaseIndex}`);
 }
 
 /**
@@ -66,6 +69,8 @@ export async function createStaging(
   if (revParse !== 0) {
     throw new Error(`Workspace is not a git repository: ${workspacePath}`);
   }
+  const status = await git(workspacePath, ["status", "--porcelain"]);
+  if (status.code !== 0 || status.stdout.trim()) throw new Error("Workspace must be clean before staging; preserve and reconcile existing changes first");
   const { code, stdout } = await git(workspacePath, [
     "worktree", "add", "-b", branch, worktreePath, "HEAD",
   ]);
@@ -78,7 +83,9 @@ export async function createStaging(
   if (baseCode !== 0 || !baseCommit.trim()) {
     throw new Error(`Failed to read base commit for phase ${phaseIndex}.`);
   }
-  return { runId, phaseIndex, branch, worktreePath, baseCommit: baseCommit.trim() };
+  const session = { runId, phaseIndex, branch, worktreePath, baseCommit: baseCommit.trim() };
+  writeFileSync(`${worktreePath}.json`, JSON.stringify(session), "utf8");
+  return session;
 }
 
 /**
@@ -91,6 +98,14 @@ export async function applyStaging(
   session: StagingSession,
   git: GitRunner = defaultGit
 ): Promise<void> {
+  if (session.reviewedCommit) {
+    const head = await git(session.worktreePath, ["rev-parse", "HEAD"]);
+    const branch = await git(workspacePath, ["rev-parse", session.branch]);
+    const dirty = await git(session.worktreePath, ["status", "--porcelain"]);
+    if (head.code !== 0 || branch.code !== 0 || dirty.code !== 0 || dirty.stdout.trim() || head.stdout.trim() !== session.reviewedCommit || branch.stdout.trim() !== session.reviewedCommit) throw new Error("Staging changed after review; a new approval is required");
+  }
+  const status = await git(workspacePath, ["status", "--porcelain"]);
+  if (status.code !== 0 || status.stdout.trim()) throw new Error("Workspace changed during review; reconcile before applying");
   const { code: mergeCode, stdout: mergeOut } = await git(workspacePath, [
     "merge", "--ff-only", session.branch,
   ]);
@@ -135,18 +150,28 @@ export async function findStaging(
   if (!existsSync(worktreePath)) return null;
   const { code, stdout } = await git(workspacePath, ["branch", "--list", branch]);
   if (code !== 0 || !stdout.trim()) return null;
-  // Re-derive the base commit:
-  // - if the branch already has commits, use the parent of its tip
-  // - otherwise the branch still points at the workspace HEAD; capture that
-  const { code: parentCode, stdout: parentOut } = await git(workspacePath, ["rev-parse", `${branch}^`]);
-  let baseCommit: string;
-  if (parentCode === 0 && parentOut.trim()) {
-    baseCommit = parentOut.trim();
-  } else {
-    const { stdout: headOut } = await git(workspacePath, ["rev-parse", branch]);
-    baseCommit = headOut.trim();
+  if (existsSync(`${worktreePath}.json`)) {
+    const saved = JSON.parse(readFileSync(`${worktreePath}.json`, "utf8")) as StagingSession;
+    if (saved.runId !== runId || saved.phaseIndex !== phaseIndex || saved.branch !== branch || saved.worktreePath !== worktreePath || !/^[0-9a-f]{40,64}$/.test(saved.baseCommit)) throw new Error("Invalid staging metadata");
+    return saved;
   }
-  return { runId, phaseIndex, branch, worktreePath, baseCommit };
+  throw new Error("Staging metadata missing; reconciliation required");
+}
+
+// Freeze the complete result before emitting an approval request. CLI agents
+// often leave uncommitted edits; a merge alone would lose those edits.
+export async function sealStaging(session: StagingSession, git: GitRunner = defaultGit): Promise<void> {
+  for (const args of [
+    ["add", "-A"],
+    ["-c", "user.name=Orkestra", "-c", "user.email=orkestra@local", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Orkestra result awaiting review"],
+  ]) {
+    const result = await git(session.worktreePath, args);
+    if (result.code !== 0) throw new Error(`Cannot seal staging: ${result.stdout}`);
+  }
+  const head = await git(session.worktreePath, ["rev-parse", "HEAD"]);
+  if (head.code !== 0) throw new Error("Cannot read sealed commit");
+  session.reviewedCommit = head.stdout.trim();
+  writeFileSync(`${session.worktreePath}.json`, JSON.stringify(session), "utf8");
 }
 
 /**

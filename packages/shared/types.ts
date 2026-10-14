@@ -3,6 +3,7 @@ export type AgentStatus = "available" | "running" | "limited" | "disabled";
 export type AgentRole = "planner" | "builder" | "reviewer" | "fixer" | "custom";
 
 export type RunStatus = "queued" | "running" | "completed" | "failed";
+export type JobState = "QUEUED" | "ASSIGNED" | "RUNNING" | "WAITING_FOR_APPROVAL" | "VERIFYING" | "COMPLETED_VERIFIED" | "COMPLETED_UNVERIFIED" | "FAILED" | "CANCELED" | "INTERRUPTED";
 
 export type RunEventType =
   | "queued"
@@ -18,7 +19,8 @@ export type RunEventType =
   | "limit_detected"
   | "fallback_used"
   | "phase_done"
-  | "phase_pending_review";
+  | "phase_pending_review"
+  | "state_changed";
 
 export interface Agent {
   id: string;
@@ -53,6 +55,8 @@ export interface Run {
    * whose changes are pending (null when none).
    */
   pendingPhase?: number | null;
+  permission?: "read-only" | "workspace-write";
+  executionState?: JobState;
 }
 
 export interface RunEvent {
@@ -102,6 +106,7 @@ export interface CreateRunRequest {
   workspacePath?: string; // verilirse aynı proje workspace'inde devam edilir (sürekli geliştirme)
   tasks?: PlanTask[]; // verilirse ekip modu (orkestratör); yoksa doğrusal pipeline
   preWriteApproval?: boolean; // agents run in a staging worktree; user reviews diff before apply
+  permission?: "read-only" | "workspace-write";
 }
 
 export interface BriefRequest {

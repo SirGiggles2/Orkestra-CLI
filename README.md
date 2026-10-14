@@ -267,19 +267,9 @@ Provider shortcuts cover native OpenAI, Anthropic, Gemini, Azure OpenAI, and Oll
 
 ## 🧩 Agent Command Mappings (Headless Parameters)
 
-To run CLI tools smoothly in headless mode without hitting visual confirmation locks or security prompts, Orkestra pipes prompts via **STDIN** and passes safety bypass arguments:
+Managed execution uses the existing Windows account, defaults to read-only, and rejects permission-bypass templates. Provider-native sandbox/tool controls remain enforced; no VM or separate account is required. Workspace writes require a staging worktree and a live, explicit diff approval. Gemini and Antigravity execution remain disabled pending separate capability-tested adapters.
 
-* **Antigravity Ajanları (Builder & Reviewer):**
-  - **Command:** `agy`
-  - **Arguments:** `["-p", "--dangerously-skip-permissions"]`
-* **Claude Ajanı (Fixer & Debate):**
-  - **Command:** `claude`
-  - **Arguments:** `["-p", "--permission-mode", "acceptEdits"]`
-* **OpenAI Codex Ajanı (Planner):**
-  - **Command:** `codex`
-  - **Arguments:** `["exec", "--dangerously-bypass-approvals-and-sandbox"]`
-
-*At runtime, the runner injects the active shell PATH (e.g. `AppData\Local\agy\bin` or npm paths) so CLI executables are resolved correctly.*
+See [PR-001 execution audit](docs/PR-001-execution-hardening.md) for tested behavior, supported configurations, and remaining limitations.
 
 ---
 
