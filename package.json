@@ -47,7 +47,9 @@
     "start": "tsx apps/server/src/index.ts",
     "orkestra": "node bin/orkestra.mjs",
     "test": "tsx --test apps/server/src/**/*.test.ts",
-    "test:smoke": "node scripts/smoke-hardening.mjs"
+    "test:smoke": "node scripts/smoke-hardening.mjs",
+    "providers:probe": "tsx scripts/probe-providers.ts",
+    "test:providers:live": "tsx scripts/test-providers-live.ts"
   },
   "engines": {
     "node": ">=20"
