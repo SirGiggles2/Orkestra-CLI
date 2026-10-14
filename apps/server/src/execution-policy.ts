@@ -21,7 +21,7 @@ export function secureAgentArgs(agent: Agent, permission: ExecutionPermission): 
       const value = agent.argsTemplate[++i];
       if (!value || !/^[a-zA-Z0-9._:/-]+$/.test(value) || value.startsWith("-")) throw new Error("Invalid model/effort selection");
       selections.push(arg, value);
-    } else if (arg === "-c" && /^model_reasoning_effort="?(low|medium|high|xhigh|minimal|none)"?$/.test(agent.argsTemplate[i + 1] ?? "")) {
+    } else if (arg === "-c" && /^model_reasoning_effort="?(low|medium|high|xhigh|max|ultra|minimal|none)"?$/.test(agent.argsTemplate[i + 1] ?? "")) {
       selections.push(arg, agent.argsTemplate[++i]);
     } else if (!allowedBare.has(arg)) throw new Error(`Agent argument disallowed by execution policy: ${arg}`);
   }

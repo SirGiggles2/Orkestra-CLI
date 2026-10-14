@@ -23,6 +23,7 @@ import { Runner } from "./runner";
 import { pathWithin, validatePlan, containedTaskPath } from "./security";
 import { executionPermission } from "./execution-policy";
 import { localOriginAllowed, localHostAllowed } from "./http-policy";
+import { providerAdapters } from "./providers";
 import { GitService } from "./git";
 import { GitHubStore, getUser, createRepo, createPr, parseGitHubRemote, deviceStart, devicePoll } from "./github";
 import { linuxFolderPicker } from "./folder-picker";
@@ -105,6 +106,7 @@ const terminalSessions = new Map<string, TerminalSession>();
 const maxTerminalBuffer = 240_000;
 
 app.get("/api/health", async () => ({ ok: true, execution: { defaultPermission: "read-only", workerIdentity: "current-account", isolation: "provider-native", remoteEnabled: false } }));
+app.get("/api/providers", async () => ({ providers: await Promise.all(Object.values(providerAdapters).map((adapter) => adapter.probe())) }));
 
 // Eki tanımlar: görselse yolu ver (CLI okur), metin/kod dosyasıysa içeriğini prompt'a göm.
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"]);

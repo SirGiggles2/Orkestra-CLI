@@ -2,6 +2,8 @@
 
 > User amendment, 2026-10-14: Run the Windows worker under the existing Windows account. Do not require a VM or separate account. This overrides the account/VM prerequisite below; provider-native permissions, approvals, credential filtering and workspace checks remain part of the implementation.
 
+> User amendment, 2026-10-14: Use Antigravity CLI (`agy`) as the Google provider after Gemini CLI returned `UNSUPPORTED_CLIENT` on fresh sign-in. Integrate Antigravity as its own provider. Retain Gemini separately; its account-tier restriction does not gate the chosen Google integration.
+
 **Project:** Custom Orkestra Multi-Agent Development Command Center
 **Status:** Approved development direction
 **Starting point:** https://github.com/burakdemir16/Orkestra-CLI

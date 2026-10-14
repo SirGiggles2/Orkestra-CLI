@@ -267,9 +267,12 @@ Provider shortcuts cover native OpenAI, Anthropic, Gemini, Azure OpenAI, and Oll
 
 ## 🧩 Agent Command Mappings (Headless Parameters)
 
-Managed execution uses the existing Windows account, defaults to read-only, and rejects permission-bypass templates. Provider-native sandbox/tool controls remain enforced; no VM or separate account is required. Workspace writes require a staging worktree and a live, explicit diff approval. Gemini and Antigravity execution remain disabled pending separate capability-tested adapters.
+Managed execution uses the existing Windows account, defaults to read-only, and rejects permission-bypass templates. Workspace writes require a staging worktree and explicit diff approval before applying to the project. The common provider layer uses Codex App Server, Claude/Gemini structured CLI output, and Antigravity CLI (`agy`) as a separate Google provider. Installed versions supply the model and capability information. No VM or separate account is required.
+
+Antigravity's current native policy permits workspace edits. Its adapter supports staged workspace writes; chat runs in disposable scratch folders. It does not advertise a native read-only guarantee. Claude and Gemini write modes remain unavailable pending live approval testing. Unsupported skills and managed subagent limits fail configuration validation.
 
 See [PR-001 execution audit](docs/PR-001-execution-hardening.md) for tested behavior, supported configurations, and remaining limitations.
+See [PR-002 provider verification](docs/PR-002-provider-adapters.md) for live results and provider access limitations. Run `npm run providers:probe` to refresh capability metadata, or `npm run test:providers:live -- antigravity` for disposable live tests. Live tests consume provider quota and return nonzero when acceptance is blocked.
 
 ---
 
@@ -279,6 +282,7 @@ The Fastify server exposes a REST API at `127.0.0.1:8787`:
 
 **Core**
 - `GET /api/health` -> System and database status.
+- `GET /api/providers` -> Installed native provider versions, authentication, model catalogs, supported controls and probe errors.
 - `GET /api/cli-status` -> Active CLI authentication info, dynamic models, and usage limits.
 - `POST /api/chat` -> Triggers Single/Multi/Debate chat prompts.
 - `POST /api/runs` -> Spawns task-based team runs.

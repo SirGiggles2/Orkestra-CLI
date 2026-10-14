@@ -20,7 +20,8 @@ export type RunEventType =
   | "fallback_used"
   | "phase_done"
   | "phase_pending_review"
-  | "state_changed";
+  | "state_changed"
+  | "provider_event";
 
 export interface Agent {
   id: string;
@@ -215,6 +216,7 @@ export interface CliToolStatus {
   limits?: string[];
   lastError?: string;
   hint?: string;
+  providerProbe?: import("./providers").ProviderProbe;
 }
 
 export interface CliStatusResponse {
