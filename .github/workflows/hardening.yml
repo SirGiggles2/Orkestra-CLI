@@ -1,0 +1,24 @@
+name: Windows execution hardening
+
+on:
+  pull_request:
+  push:
+    branches: [main, pr-001-execution-hardening]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:smoke

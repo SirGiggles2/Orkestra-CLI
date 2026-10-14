@@ -20,6 +20,9 @@ import { getConfig } from "./config";
 import { Store, defaultLimitPatterns } from "./db";
 import { EventHub } from "./events";
 import { Runner } from "./runner";
+import { pathWithin, validatePlan, containedTaskPath } from "./security";
+import { executionPermission, assertIsolatedWorker } from "./execution-policy";
+import { localOriginAllowed, localHostAllowed } from "./http-policy";
 import { GitService } from "./git";
 import { GitHubStore, getUser, createRepo, createPr, parseGitHubRemote, deviceStart, devicePoll } from "./github";
 import { linuxFolderPicker } from "./folder-picker";
@@ -47,8 +50,6 @@ const hub = new EventHub();
 const runner = new Runner(store, hub, { stagingRoot: join(config.dataDir, "staging") });
 const git = new GitService(process.cwd());
 const githubStore = new GitHubStore(config.dataDir);
-// Ajan git push/clone'u için token'ı bellekte runner'a ver (diske yazmadan).
-void githubStore.getToken().then((t) => { runner.githubToken = t; });
 // UI'dan eklenen API sağlayıcıları: çalıştırma anında runner buradan (şifreli store) çözer.
 const apiProviderStore = new ApiProviderStore(config.dataDir);
 runner.getStoredApiProvider = (command) => apiProviderStore.get(command);
@@ -67,7 +68,12 @@ const previews = new PreviewManager();
 const app = Fastify({ logger: true, bodyLimit: 25 * 1024 * 1024 });
 const uploadsDir = join(config.dataDir, "uploads");
 mkdirSync(uploadsDir, { recursive: true });
-await app.register(cors, { origin: true });
+await app.register(cors, { origin: (origin, cb) => cb(null, localOriginAllowed(origin, config.port)) });
+app.addHook("onRequest", async (request, reply) => {
+  if (!localHostAllowed(request.headers.host, config.port) || !localOriginAllowed(request.headers.origin, config.port) || request.headers["sec-fetch-site"] === "cross-site") return reply.code(403).send({ error: "Untrusted host or origin" });
+  if ((request.url.startsWith("/api/terminals") || request.url.startsWith("/api/cli/") && /\/(install|login|login-window)/.test(request.url)) && process.env.ORKESTRA_ENABLE_LOCAL_TERMINAL !== "1") return reply.code(403).send({ error: "Interactive terminal and install/login commands require ORKESTRA_ENABLE_LOCAL_TERMINAL=1 on this local host" });
+  if (request.url.startsWith("/api/preview/start/") && process.env.ORKESTRA_ENABLE_LOCAL_TERMINAL !== "1") return reply.code(403).send({ error: "Executing project preview scripts requires local terminal authorization" });
+});
 
 // Üretim / global kurulum: derlenmiş web arayüzünü (dist/web) sunucudan servis et. Geliştirmede
 // (vite ayrı port) bu klasör yoksa atlanır. SPA fallback → istemci rotaları index.html'e düşer.
@@ -98,7 +104,7 @@ type TerminalSession = {
 const terminalSessions = new Map<string, TerminalSession>();
 const maxTerminalBuffer = 240_000;
 
-app.get("/api/health", async () => ({ ok: true }));
+app.get("/api/health", async () => ({ ok: true, execution: { defaultPermission: "read-only", isolatedWorkerConfigured: process.env.ORKESTRA_ISOLATED_WORKER === "1", remoteEnabled: false } }));
 
 // Eki tanımlar: görselse yolu ver (CLI okur), metin/kod dosyasıysa içeriğini prompt'a göm.
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"]);
@@ -591,6 +597,11 @@ app.post<{ Body: CreateRunRequest }>("/api/runs", async (request, reply) => {
     return reply.code(400).send({ error: "Prompt is required" });
   }
 
+  try {
+    executionPermission(request.body);
+    if (request.body.tasks !== undefined) validatePlan(request.body.tasks);
+  } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
+
   const id = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14) + "-" + randomUUID().slice(0, 8);
 
   // Sürekli proje: workspacePath verilmişse aynı projede devam et (güvenlik için
@@ -602,8 +613,14 @@ app.post<{ Body: CreateRunRequest }>("/api/runs", async (request, reply) => {
     // workspaceDir altında VEYA kullanıcının açtığı dış proje kökü → o klasörde devam et.
     if (underWorkspaceOrOpened(resolved)) {
       workspacePath = resolved;
-    }
+    } else return reply.code(403).send({ error: "Workspace path is not approved" });
   }
+
+  try {
+    runner.assertWorkspaceAvailable(workspacePath);
+    if (executionPermission(request.body) === "workspace-write") assertIsolatedWorker();
+    for (const task of request.body.tasks ?? []) containedTaskPath(workspacePath, task.folder);
+  } catch (error) { return reply.code(409).send({ error: (error as Error).message }); }
 
   const run = {
     id,
@@ -615,6 +632,7 @@ app.post<{ Body: CreateRunRequest }>("/api/runs", async (request, reply) => {
     activeStep: "queued",
     summary: null,
     preWriteApproval: request.body.preWriteApproval === true,
+    permission: executionPermission(request.body),
     pendingPhase: null
   };
   store.createRun(run);
@@ -627,14 +645,6 @@ app.post<{ Body: CreateRunRequest }>("/api/runs", async (request, reply) => {
     createdAt: new Date().toISOString()
   });
   hub.publish(event);
-  // Diff paneli için baz: workspace'i git deposu yapıp run ÖNCESİ durumu commit'le.
-  // Böylece sonradan working-tree diff yalnızca bu run'ın değişikliklerini gösterir.
-  try {
-    mkdirSync(workspacePath, { recursive: true });
-    await new GitService(workspacePath).commitBaseline();
-  } catch (err) {
-    app.log.warn(`git baseline failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
   // Görev planı verilmişse ekip modu; yoksa doğrusal pipeline.
   if (request.body.tasks?.length) {
     runner.startTeam(run, request.body.tasks);
@@ -658,7 +668,7 @@ app.post<{ Params: { id: string }; Body: { note?: string } }>("/api/runs/:id/not
 // UI her durumda durur (sessizce takılı kalmaz).
 app.post<{ Params: { id: string } }>("/api/runs/:id/stop", async (request, _reply) => {
   const id = request.params.id;
-  const killed = runner.stop(id);
+  const killed = await runner.stop(id);
   const run = store.getRun(id);
   if (run && run.status !== "completed" && run.status !== "failed") {
     store.updateRun(id, { status: "failed", activeStep: "stopped", completedAt: new Date().toISOString(), summary: "Durduruldu." });
@@ -1060,7 +1070,6 @@ app.post<{ Body: { token?: string } }>("/api/github/connect", async (request, re
   try {
     const user = await getUser(token); // geçersizse fırlatır
     await githubStore.setToken(token);
-    runner.githubToken = token;
     return { connected: true, ...user };
   } catch (error) {
     return reply.code(401).send({ error: error instanceof Error ? error.message : "Token geçersiz." });
@@ -1069,7 +1078,6 @@ app.post<{ Body: { token?: string } }>("/api/github/connect", async (request, re
 
 app.post("/api/github/disconnect", async () => {
   githubStore.clear();
-  runner.githubToken = null;
   return { connected: false };
 });
 
@@ -1101,7 +1109,6 @@ app.post<{ Body: { deviceCode?: string } }>("/api/github/device/poll", async (re
     const r = await devicePoll(clientId, deviceCode);
     if (r.token) {
       await githubStore.setToken(r.token);
-      runner.githubToken = r.token;
       const user = await getUser(r.token);
       return { connected: true, ...user };
     }
@@ -1246,13 +1253,13 @@ loadOpenedRoots();
 
 function isPathAllowed(target: string) {
   const resolved = resolve(target);
-  return allowedRoots.some((root) => resolved.startsWith(root)) || [...openedRoots].some((root) => resolved.startsWith(root));
+  return [...allowedRoots, ...openedRoots].some((root) => pathWithin(root, resolved));
 }
 
 // workspaceDir VEYA açılan dış köklerden biri altında mı? (run/dosya/aç izinleri için)
 function underWorkspaceOrOpened(resolved: string): boolean {
   const roots = [resolve(config.workspaceDir), ...openedRoots];
-  return roots.some((root) => resolved === root || resolved.startsWith(`${root}/`) || resolved.startsWith(`${root}\\`));
+  return roots.some((root) => pathWithin(root, resolved));
 }
 
 app.get<{ Querystring: { path?: string } }>("/api/files", async (request, reply) => {
@@ -1477,12 +1484,12 @@ app.get<{ Params: { runId: string; "*": string } }>("/preview/:runId/*", async (
   const run = store.getRun(request.params.runId);
   if (!run) return reply.code(404).send({ error: "Run not found" });
   const filePath = normalize(join(run.workspacePath, request.params["*"] || "index.html"));
-  if (!filePath.startsWith(normalize(run.workspacePath))) return reply.code(403).send({ error: "Forbidden" });
+  if (!pathWithin(run.workspacePath, filePath)) return reply.code(403).send({ error: "Forbidden" });
   if (!existsSync(filePath)) return reply.code(404).send({ error: "File not found" });
   const ext = extname(filePath).toLowerCase();
   const mime = mimeTypes[ext] || "application/octet-stream";
   const content = readFileSync(filePath);
-  return reply.type(mime).send(content);
+  return reply.header("Content-Security-Policy", "sandbox allow-scripts; default-src 'self' data:; connect-src 'none'").type(mime).send(content);
 });
 
 // Sunucu kapanırken ajan süreçlerini öldür, vite dev süreçlerini kapat, fastify'i kapat,
@@ -1504,7 +1511,7 @@ async function gracefulShutdown(signal: string) {
   forceExit.unref();
   console.log(`[shutdown] ${signal} received — closing server`);
   try {
-    const killed = runner.stopAll();
+    const killed = await runner.stopAll();
     if (killed > 0) console.log(`[shutdown] stopped ${killed} active run(s)`);
   } catch (err) {
     console.error("[shutdown] runner.stopAll failed:", err);

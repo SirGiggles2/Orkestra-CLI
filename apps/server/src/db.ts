@@ -1,8 +1,9 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Agent, AgentRole, AgentStatus, Run, RunEvent } from "../../../packages/shared/types";
 import type { AppConfig } from "./config";
 import { loadApiProviderAgents } from "./apiProviders";
+import { assertJobTransition, type JobState } from "./job-state";
 
 // Derlemesiz, native-bağımlılıksız depo: veriyi bellekte tutar, tek JSON dosyasına yazar.
 // (Eski better-sqlite3 yerine — böylece her Node sürümünde, Python/build-tools olmadan kurulur.)
@@ -23,10 +24,17 @@ export class Store {
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config: AppConfig) {
+    mkdirSync(config.dataDir, { recursive: true });
     this.file = join(config.dataDir, "orkestra.json");
     this.data = this.load();
     this.seedAgents();
     this.repairDefaultAgentRoles();
+    for (const run of this.data.runs) {
+      run.executionState ??= run.status === "completed" ? "COMPLETED_UNVERIFIED" : run.status === "failed" ? "FAILED" : run.status === "running" ? "RUNNING" : "QUEUED";
+      if (["QUEUED", "ASSIGNED", "RUNNING", "WAITING_FOR_APPROVAL", "VERIFYING"].includes(run.executionState)) {
+        this.updateRun(run.id, { status: "failed", executionState: "INTERRUPTED", activeStep: "interrupted", summary: "Server restarted. Reconcile side effects and pending approvals before submitting a new run.", completedAt: new Date().toISOString() });
+      }
+    }
   }
 
   private load(): DbShape {
@@ -39,8 +47,8 @@ export class Store {
           events: raw.events ?? [],
           eventSeq: raw.eventSeq ?? 0
         };
-      } catch {
-        /* bozuk dosya → sıfırdan başla */
+      } catch (error) {
+        throw new Error(`Job store unreadable; refusing to reset execution history: ${(error as Error).message}`);
       }
     }
     return { agents: [], runs: [], events: [], eventSeq: 0 };
@@ -57,13 +65,10 @@ export class Store {
 
   // Senkron, atomik yazım (çıkışta da çağrılabilir).
   flush() {
-    try {
-      const tmp = `${this.file}.tmp`;
-      writeFileSync(tmp, JSON.stringify(this.data), "utf8");
-      renameSync(tmp, this.file);
-    } catch {
-      /* yoksay */
-    }
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = null; }
+    const tmp = `${this.file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.data), "utf8");
+    renameSync(tmp, this.file);
   }
 
   private seedAgents() {
@@ -181,11 +186,14 @@ export class Store {
   }
 
   createRun(run: Run) {
-    this.data.runs.push({ ...run });
+    if (this.getRun(run.id)) throw new Error("Duplicate run ID");
+    this.data.runs.push({ ...run, executionState: "QUEUED" });
     // Dosyayı sınırlı tut: en yeni MAX_RUNS run + ilgili olaylar kalsın.
     if (this.data.runs.length > MAX_RUNS) {
       this.data.runs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-      const kept = this.data.runs.slice(0, MAX_RUNS);
+      const active = this.data.runs.filter((r) => r.status === "queued" || r.status === "running");
+      const terminal = this.data.runs.filter((r) => r.status !== "queued" && r.status !== "running").slice(0, MAX_RUNS);
+      const kept = [...active, ...terminal];
       const keptIds = new Set(kept.map((r) => r.id));
       this.data.runs = kept;
       this.data.events = this.data.events.filter((e) => keptIds.has(e.runId));
@@ -196,8 +204,22 @@ export class Store {
   updateRun(id: string, patch: Partial<Run>) {
     const run = this.data.runs.find((r) => r.id === id);
     if (!run) return;
-    Object.assign(run, patch);
-    this.persist();
+    const from = run.executionState ?? "QUEUED";
+    let to: JobState = patch.executionState ?? from;
+    if (!patch.executionState) {
+      if (patch.status === "failed") to = patch.activeStep === "stopped" || patch.activeStep === "discarded" ? "CANCELED" : "FAILED";
+      else if (patch.status === "completed") to = "COMPLETED_UNVERIFIED";
+      else if (patch.status === "running") to = "RUNNING";
+      else if (/pending review|awaiting/.test(patch.activeStep ?? "")) to = "WAITING_FOR_APPROVAL";
+    }
+    // Repeated failure cleanup must preserve terminal cancellation/interruption.
+    if (["CANCELED", "INTERRUPTED"].includes(from) && patch.status === "failed" && !patch.executionState) to = from;
+    assertJobTransition(from, to);
+    const expectedStatus = to === "QUEUED" || to === "ASSIGNED" ? "queued" : to.startsWith("COMPLETED_") ? "completed" : ["FAILED", "CANCELED", "INTERRUPTED"].includes(to) ? "failed" : "running";
+    if (patch.status && patch.status !== expectedStatus) throw new Error("Job status contradicts its execution state");
+    Object.assign(run, patch, { executionState: to, status: expectedStatus });
+    if (from !== to) this.data.events.push({ id: ++this.data.eventSeq, runId: id, type: "state_changed", message: `${from} → ${to}`, createdAt: new Date().toISOString() });
+    this.flush();
   }
 
   listRuns(): Run[] {

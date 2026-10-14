@@ -1,13 +1,13 @@
-import { spawn, execFile } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, dirname } from "node:path";
 import type { Agent, PlanTask, Run, RunEventType } from "../../../packages/shared/types";
-import { interpolateArgs } from "./template";
-import { GitService } from "./git";
-import { applyStaging, createStaging, discardStaging, findStaging, type StagingSession } from "./staging";
+import { applyStaging, createStaging, discardStaging, findStaging, sealStaging, type StagingSession } from "./staging";
 import type { Store } from "./db";
 import type { EventHub } from "./events";
 import { getApiProviderConfig, runApiProvider, type ApiProviderConfig } from "./apiProviders";
+import { agentEnvironment, canonicalPath, containedTaskPath, pathWithin, validatePlan } from "./security";
+import { spawnCommand, killProcessTree, structuredFailure } from "./process";
+import { assertIsolatedWorker, executionPermission, secureAgentArgs } from "./execution-policy";
 
 // Ajan başına yürütme zaman aşımı (saniye). Gerçek kodlama görevleri 5 dk'yı kolayca aşar;
 // varsayılan 30 dk. ORKESTRA_AGENT_TIMEOUT_SECONDS ile değiştirilebilir.
@@ -28,27 +28,11 @@ function isTransientRateLimit(message: string): boolean {
   return /\b429\b|rate[ _-]?limit|too many requests|overloaded|temporarily/.test(m);
 }
 
-// agy çalışmadan ÖNCE workspace'i settings.json'daki trustedWorkspaces'e ekler →
-// agy "Do you trust this folder?" sormadan headless çalışır (interaktif onay gerekmez).
+// Compatibility guard: global trust changes require a separate human workflow.
 export function ensureAgyTrusted(workspacePath: string) {
-  try {
-    const dir = join(process.env.USERPROFILE ?? "", ".gemini", "antigravity-cli");
-    const file = join(dir, "settings.json");
-    mkdirSync(dir, { recursive: true });
-    let settings: Record<string, unknown> = {};
-    if (existsSync(file)) {
-      try { settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>; } catch { settings = {}; }
-    }
-    const list = Array.isArray(settings.trustedWorkspaces) ? (settings.trustedWorkspaces as string[]) : [];
-    const norm = workspacePath.replace(/\//g, "\\");
-    if (!list.some((p) => p.toLowerCase() === norm.toLowerCase())) {
-      list.push(norm);
-      settings.trustedWorkspaces = list;
-      writeFileSync(file, JSON.stringify(settings, null, 2), "utf8");
-    }
-  } catch {
-    // sessizce geç — trust yazılamazsa agy yine interaktif sorar
-  }
+  // Kept as a compatibility export; managed runs must never change global trust.
+  void workspacePath;
+  throw new Error("Automatic global workspace trust is disabled");
 }
 
 const flowRoles = ["planner", "builder", "reviewer", "fixer"] as const;
@@ -65,6 +49,7 @@ type RunControl = {
   stop: boolean;
   // TÜM aktif çocuk süreçler (paralel ajanlar). Durdurmada hepsi öldürülür.
   children: Set<ReturnType<typeof spawnCommand>>;
+  aborters?: Set<AbortController>;
   resume?: () => void; // faz onayı: kullanıcı "devam et" deyince bir sonraki faza geçer
   // Pre-write diff approval: emit phase_pending_review, wait for user.
   approve?: () => void;
@@ -73,9 +58,7 @@ type RunControl = {
 
 export class Runner {
   private controls = new Map<string, RunControl>();
-  // GitHub token'ı (yalnızca bellekte). Ajanın git push/clone/fetch'i için süreç ortamına
-  // GIT_CONFIG ile geçirilir → token diske YAZILMAZ. index.ts bağlan/kes'te günceller.
-  githubToken: string | null = null;
+  private workspaceOwners = new Map<string, string>();
   // index.ts bunu ApiProviderStore'a bağlar → UI'dan eklenen sağlayıcılar çalıştırma anında çözülür.
   getStoredApiProvider?: (command: string) => Promise<ApiProviderConfig | undefined>;
   // Pre-write diff approval: worktrees are created under this root. The
@@ -91,21 +74,54 @@ export class Runner {
   }
 
   start(run: Run) {
+    this.claimWorkspace(run);
     this.controls.set(run.id, { notes: [], stop: false, children: new Set() });
     void this.execute(run);
   }
 
   // Ekip modu: alt-görevleri bağımlılığa göre çalıştırır (bağımsızlar paralel).
   startTeam(run: Run, tasks: PlanTask[]) {
+    validatePlan(tasks);
+    executionPermission(run);
+    for (const task of tasks) containedTaskPath(run.workspacePath, task.folder);
+    this.claimWorkspace(run);
     this.controls.set(run.id, { notes: [], stop: false, children: new Set() });
     void this.executeTeam(run, tasks);
+  }
+
+  assertWorkspaceAvailable(path: string) {
+    for (const existing of this.workspaceOwners.keys()) {
+      if (pathWithin(existing, path) || pathWithin(path, existing)) throw new Error("Workspace already has an active run");
+    }
+  }
+
+  private claimWorkspace(run: Run) {
+    if (this.store.getRun(run.id)?.executionState !== "QUEUED") throw new Error("Only queued jobs may start; interrupted work requires reconciliation");
+    executionPermission(run);
+    if (executionPermission(run) === "workspace-write") assertIsolatedWorker();
+    this.assertWorkspaceAvailable(run.workspacePath);
+    this.workspaceOwners.set(canonicalPath(run.workspacePath), run.id);
+  }
+
+  private releaseWorkspace(runId: string) {
+    this.controls.delete(runId);
+    for (const [path, owner] of this.workspaceOwners) if (owner === runId) this.workspaceOwners.delete(path);
+  }
+
+  private waitForApproval(runId: string, control?: RunControl): Promise<"approve" | "discard"> {
+    if (!control || control.stop || this.controls.get(runId) !== control) return Promise.reject(new Error("Missing live approval state; reconciliation required"));
+    return new Promise((resolveDecision) => {
+      control.approve = () => resolveDecision("approve");
+      control.discard = () => resolveDecision("discard");
+    });
   }
 
   // Pre-write diff approval: kullanıcı "Uygula" dedi. workspace'e merge et,
   // mevcut fazı tamamla ve sıradakine geç. Yalnızca canlı bekleyen phase_pending_review için çalışır.
   applyPendingPhase(runId: string): boolean {
     const control = this.controls.get(runId);
-    if (control?.approve) {
+    if (control?.approve && !control.stop) {
+      this.store.updateRun(runId, { executionState: "RUNNING", activeStep: "applying approved phase" });
       const fn = control.approve;
       control.approve = undefined;
       control.discard = undefined;
@@ -129,29 +145,19 @@ export class Runner {
     return false;
   }
 
-  // Faz onayı: kullanıcı "devam et" dediğinde bir sonraki faz başlar.
-  // Canlı bekleyen promise varsa onu serbest bırakır; yoksa (durduruldu/sunucu yeniden başladı)
-  // diske kalıcı yazılan faz state'inden kaldığı yeri YENİDEN ayağa kaldırır.
+  // Resume only a live phase boundary explicitly confirmed by the user.
   resumeRun(runId: string): boolean {
     const control = this.controls.get(runId);
-    if (control?.resume) {
+    if (control?.resume && !control.stop) {
+      this.store.updateRun(runId, { executionState: "RUNNING", activeStep: "continuing approved phase" });
       const fn = control.resume;
       control.resume = undefined;
       fn();
       return true;
     }
-    // Kalıcı state'ten devam (canlı bekleyen yoksa).
-    const run = this.store.getRun(runId);
-    if (!run) return false;
-    const state = loadPhaseState(run.workspacePath);
-    if (!state || state.nextPhaseIndex == null || state.nextPhaseIndex >= (state.tasks ? new Set(state.tasks.map((t) => t.phase ?? 1)).size : 0)) {
-      return false;
-    }
-    this.controls.set(runId, { notes: [], stop: false, children: new Set() });
-    this.store.updateRun(runId, { status: "running", activeStep: `resuming phase ${state.nextPhaseIndex + 1}`, completedAt: null });
-    this.emit(runId, "started", runLang(run.prompt) === "en" ? `▶️ Resuming phase ${state.nextPhaseIndex + 1}.` : `▶️ Faz ${state.nextPhaseIndex + 1} kaldığı yerden başlatılıyor.`);
-    void this.runPhasesFrom(run, state.tasks, new Map(state.done ?? []), state.nextPhaseIndex);
-    return true;
+    // Persisted phase cursors do not prove an action had no side effects.
+    // Inspect the retained worktree/state and explicitly submit reconciled work.
+    return false;
   }
 
   private async executeTeam(run: Run, tasks: PlanTask[]) {
@@ -162,16 +168,14 @@ export class Runner {
       : (lang === "en" ? `Team work started (${tasks.length} tasks).` : `Ekip çalışması başladı (${tasks.length} görev).`);
     this.emit(run.id, "started", startMsg);
     try {
+      validatePlan(tasks);
       mkdirSync(run.workspacePath, { recursive: true });
-      await GitService.ensureRepo(run.workspacePath); // proje kendi git deposu olsun (izolasyon)
-      writeFileSync(join(run.workspacePath, "PROMPT.md"), run.prompt, "utf8");
-      this.emit(run.id, "file_created", "PROMPT.md", null, JSON.stringify({ path: "PROMPT.md", adds: 0, dels: 0 }));
       await this.runPhasesFrom(run, tasks, new Map(), 0);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.store.updateRun(run.id, { status: "failed", activeStep: "failed", completedAt: new Date().toISOString(), summary: message });
       this.emit(run.id, "failed", message);
-      this.controls.delete(run.id);
+      this.releaseWorkspace(run.id);
     }
   }
 
@@ -202,20 +206,19 @@ export class Runner {
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             this.emit(run.id, "failed", en ? `Staging worktree failed: ${message}` : `Çalışma alanı hazırlanamadı: ${message}`);
-            savePhaseState(run.workspacePath, { tasks, done: [...done], nextPhaseIndex: pi });
-            return;
+            savePhaseState(join(this.stagingRoot, run.id), { tasks, done: [...done], nextPhaseIndex: pi });
+            throw new Error(`Staging failed: ${message}`);
           }
         }
 
         const phaseResult = await this.executePhaseTasks(run, phaseTasks, done, control, { staging: staging ?? undefined });
         if (phaseResult === "stopped") {
-          // Faz İÇİNDE durduruldu → staging varsa temizle, bu fazı (pi) tekrar
-          // çalıştır (ajanlar mevcut dosyaları görüp tamamlar). State korunur.
+          // Canceled phases are retained for reconciliation, never replayed.
           if (staging) {
             await discardStaging(run.workspacePath, staging).catch(() => undefined);
             this.store.updateRun(run.id, { pendingPhase: null });
           }
-          savePhaseState(run.workspacePath, { tasks, done: [...done], nextPhaseIndex: pi });
+          savePhaseState(join(this.stagingRoot, run.id), { tasks, done: [...done], nextPhaseIndex: pi });
           return;
         }
         if (phaseResult === "pending_review") {
@@ -225,23 +228,20 @@ export class Runner {
             const found = await findStaging(run.workspacePath, this.stagingRoot, run.id, phaseNo);
             if (!found) {
               this.emit(run.id, "failed", en ? "Pending review but no staging worktree found." : "Onay bekliyor ama çalışma alanı bulunamadı.");
-              savePhaseState(run.workspacePath, { tasks, done: [...done], nextPhaseIndex: pi });
-              return;
+              savePhaseState(join(this.stagingRoot, run.id), { tasks, done: [...done], nextPhaseIndex: pi });
+              throw new Error("Pending staging session missing; reconciliation required");
             }
             staging = found;
           }
-          savePhaseState(run.workspacePath, { tasks, done: [...done], nextPhaseIndex: pi });
+          savePhaseState(join(this.stagingRoot, run.id), { tasks, done: [...done], nextPhaseIndex: pi });
+          await sealStaging(staging);
           const phaseLines = phaseTasks.map((t) => `• ${t.title}`).join("\n");
           const report = en
             ? `📝 Phase ${phaseNo}/${phases.length} ready for review:\n${phaseLines}\n\nReview the pending diff and Apply or Discard.`
             : `📝 Faz ${phaseNo}/${phases.length} incelemeye hazır:\n${phaseLines}\n\nBekleyen değişikliği inceleyin, Uygula veya At.`;
           this.store.updateRun(run.id, { activeStep: `phase ${phaseNo} pending review` });
           this.emit(run.id, "phase_pending_review", report);
-          const decision = await new Promise<"approve" | "discard" | "stop">((resolveD) => {
-            if (!control) return resolveD("approve"); // sunucu yeniden başladıysa otomatik uygula
-            control.approve = () => resolveD("approve");
-            control.discard = () => resolveD("discard");
-          });
+          const decision = await this.waitForApproval(run.id, control);
           // Tek kullanımlık: temizle
           if (control) { control.approve = undefined; control.discard = undefined; }
           if (decision === "discard" || control?.stop) {
@@ -252,11 +252,10 @@ export class Runner {
             if (control?.stop) {
               this.store.updateRun(run.id, { status: "failed", activeStep: "discarded", completedAt: new Date().toISOString(), summary: en ? "Discarded by user." : "Kullanıcı tarafından atıldı." });
               this.emit(run.id, "failed", en ? "🗑️ Discarded. Stopping the run." : "🗑️ Atıldı. Çalışma durduruluyor.");
-              this.controls.delete(run.id);
+              this.releaseWorkspace(run.id);
               return;
             }
-            // Discard without stop: skip this phase, continue.
-            continue;
+            throw new Error("Phase discarded; dependent work canceled");
           }
           // Approve: merge staging into workspace, then continue.
           try {
@@ -264,8 +263,8 @@ export class Runner {
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             this.emit(run.id, "failed", en ? `Apply failed: ${message}` : `Uygulama başarısız: ${message}`);
-            savePhaseState(run.workspacePath, { tasks, done: [...done], nextPhaseIndex: pi });
-            return;
+            savePhaseState(join(this.stagingRoot, run.id), { tasks, done: [...done], nextPhaseIndex: pi });
+            throw new Error(`Apply failed: ${message}`);
           }
           this.store.updateRun(run.id, { pendingPhase: null });
         }
@@ -275,7 +274,7 @@ export class Runner {
 
         if (multiPhase && !lastPhase) {
           // İlerlemeyi kalıcı yaz, sonra onay bekle.
-          savePhaseState(run.workspacePath, { tasks, done: [...done], nextPhaseIndex: pi + 1 });
+          savePhaseState(join(this.stagingRoot, run.id), { tasks, done: [...done], nextPhaseIndex: pi + 1 });
           const report = en
             ? `✅ Phase ${phaseNo}/${phases.length} complete:\n${phaseLines}\n\nApprove to continue to the next phase?`
             : `✅ Faz ${phaseNo}/${phases.length} tamamlandı:\n${phaseLines}\n\nOnaylıyorsanız sıradaki faza devam edeyim mi?`;
@@ -283,13 +282,13 @@ export class Runner {
           this.emit(run.id, "phase_done", report);
           await new Promise<void>((resolve) => {
             if (control) control.resume = resolve;
-            else resolve();
+            else throw new Error("Missing live approval state; reconciliation required");
           });
           if (control?.stop) {
             // Durdurma: state korunur (sonra "devam et" ile yine açılabilir). Run "stopped" işaretlenir.
-            this.store.updateRun(run.id, { status: "failed", activeStep: "stopped", completedAt: new Date().toISOString(), summary: en ? "Paused — resume with 'continue'." : "Duraklatıldı — 'devam et' ile sürdürülebilir." });
+            this.store.updateRun(run.id, { status: "failed", activeStep: "stopped", completedAt: new Date().toISOString(), summary: en ? "Canceled — reconcile side effects before new work." : "Duraklatıldı — 'devam et' ile sürdürülebilir." });
             this.emit(run.id, "failed", en ? "⏸️ Paused. Use 'Continue to next phase' to resume." : "⏸️ Duraklatıldı. 'Sıradaki faza devam et' ile kaldığı yerden sürebilirsin.");
-            this.controls.delete(run.id);
+            this.releaseWorkspace(run.id);
             return;
           }
         }
@@ -297,9 +296,7 @@ export class Runner {
 
       // Tüm fazlar bitti → tamamlandı, kalıcı state temizlenir.
       const transcript = tasks.map((t) => `## ${t.title} (${t.id})\n${done.get(t.id) ?? "(çalışmadı)"}`).join("\n\n");
-      writeFileSync(join(run.workspacePath, "TRANSCRIPT.md"), transcript, "utf8");
-      this.emit(run.id, "file_created", "TRANSCRIPT.md", null, JSON.stringify({ path: "TRANSCRIPT.md", adds: 0, dels: 0 }));
-      clearPhaseState(run.workspacePath);
+      this.emit(run.id, "stdout", transcript);
 
       let report: string;
       if (tasks.length === 1) {
@@ -314,8 +311,12 @@ export class Runner {
       }
       this.store.updateRun(run.id, { status: "completed", activeStep: "completed", completedAt: new Date().toISOString(), summary: report });
       this.emit(run.id, "completed", report);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.store.updateRun(run.id, { status: "failed", activeStep: "failed", completedAt: new Date().toISOString(), summary: message });
+      this.emit(run.id, "failed", message);
     } finally {
-      this.controls.delete(run.id);
+      this.releaseWorkspace(run.id);
     }
   }
 
@@ -333,27 +334,30 @@ export class Runner {
   ): Promise<"stopped" | "completed" | "pending_review"> {
     const en = runLang(run.prompt) === "en";
     const remaining = [...phaseTasks];
-    const phaseIds = new Set(phaseTasks.map((t) => t.id));
+
     while (remaining.length) {
       if (control?.stop) {
-        this.store.updateRun(run.id, { status: "failed", activeStep: "stopped", completedAt: new Date().toISOString(), summary: en ? "Paused — resume with 'continue'." : "Duraklatıldı — 'devam et' ile sürdürülebilir." });
+        this.store.updateRun(run.id, { status: "failed", activeStep: "stopped", completedAt: new Date().toISOString(), summary: en ? "Canceled — reconcile side effects before new work." : "Duraklatıldı — 'devam et' ile sürdürülebilir." });
         this.emit(run.id, "failed", en ? "⏸️ Paused. Use 'Continue to next phase' to resume." : "⏸️ Duraklatıldı. 'Sıradaki faza devam et' ile kaldığı yerden sürdürebilirsin.");
-        this.controls.delete(run.id);
+        this.releaseWorkspace(run.id);
         return "stopped";
       }
       // Bağımlılıkları (bu faz içinde) tamamlanmış görevler paralel koşar.
-      const ready = remaining.filter((t) => (t.dependsOn ?? []).filter((d) => phaseIds.has(d)).every((d) => done.has(d)));
+      const ready = remaining.filter((t) => (t.dependsOn ?? []).every((d) => done.has(d)));
       if (!ready.length) {
-        this.emit(run.id, "failed", en ? "Unresolvable task dependency (cycle?). Remaining tasks skipped." : "Çözülemeyen görev bağımlılığı (döngü?). Kalan görevler atlandı.");
-        break;
+        throw new Error("Unresolvable task dependency (missing, failed, or cyclic)");
       }
       this.store.updateRun(run.id, { activeStep: `team: ${ready.map((t) => t.id).join(", ")}` });
       const roles = new Set(ready.map((t) => t.role ?? "builder"));
       if (roles.has("reviewer")) this.emit(run.id, "agent_step", en ? "🔍 Coding done — reviewing the code against the goal…" : "🔍 Kodlama bitti — kod amaca uygunluk açısından denetleniyor…");
       else if (roles.has("fixer")) this.emit(run.id, "agent_step", en ? "🔧 Fixing the detected issues…" : "🔧 Tespit edilen sorunlar ayıklanıyor / düzeltiliyor…");
-      else if (ready.length > 1) this.emit(run.id, "agent_step", en ? `✍️ Coding ${ready.length} tasks in parallel…` : `✍️ ${ready.length} görev paralel kodlanıyor…`);
-      const results = await Promise.all(ready.map((task) => this.runTeamTask(run, task, done, opts)));
-      results.forEach((res, i) => done.set(ready[i].id, res));
+      else if (ready.length > 1) this.emit(run.id, "agent_step", `Executing ${ready.length} ready tasks sequentially in the shared workspace.`);
+      for (const task of ready) {
+        if (control?.stop) throw new Error("Run canceled");
+        const result = await this.runTeamTask(run, task, done, opts);
+        if (control?.stop) throw new Error("Run canceled");
+        done.set(task.id, result);
+      }
       for (const task of ready) {
         const index = remaining.findIndex((t) => t.id === task.id);
         if (index >= 0) remaining.splice(index, 1);
@@ -368,18 +372,16 @@ export class Runner {
     // 1) task.agentId → konfigüre ajan
     // 2) task.cli → doğrudan oturum açılmış CLI'dan ad-hoc ajan (planlayıcısız ekip akışı)
     // 3) role → role uygun konfigüre ajan
-    const primary =
-      (task.agentId ? this.store.getAgent(task.agentId) : undefined) ??
-      (task.cli ? adHocAgent(task.cli, task.model, role) : undefined) ??
-      this.pickAgent(role) ??
-      this.store.listAgents().find((a) => a.enabled && a.role === role);
+    const primary = task.agentId ? this.store.getAgent(task.agentId)
+      : task.cli ? adHocAgent(task.cli, task.model, role)
+      : this.pickAgent(role);
     if (!primary || !primary.enabled) {
       this.emit(run.id, "failed", `Göreve ajan atanamadı: ${task.title}`);
-      return "(ajan yok)";
+      throw new Error(`No enabled agent for task ${task.id}`);
     }
-    const folder = (task.folder ?? "").replace(/[^a-z0-9._/-]/gi, "");
+    const folder = task.folder ?? "";
     const baseCwd = opts?.staging?.worktreePath ?? run.workspacePath;
-    const cwd = folder ? join(baseCwd, folder) : baseCwd;
+    const cwd = containedTaskPath(baseCwd, folder);
     const depContext = (task.dependsOn ?? [])
       .map((d) => done.get(d))
       .filter(Boolean)
@@ -418,7 +420,7 @@ export class Runner {
     for (let i = 0; i < chain.length; i++) {
       const agent = chain[i];
       // Durduruldu → yedek ajan başlatma, hemen çık.
-      if (ctrl?.stop) return "(durduruldu)";
+      if (ctrl?.stop) throw new Error("Run canceled");
       // Güncel durum: bu ajan bu sırada limite takıldıysa atla.
       if (this.store.getAgent(agent.id)?.status === "limited") {
         this.emit(run.id, "limit_detected", `${agent.name} limitli, atlanıyor.`, agent.id);
@@ -436,10 +438,10 @@ export class Runner {
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
         this.emit(run.id, "failed", `${task.title} (${agent.name}): ${lastError}`, agent.id);
-        // sonraki yedeğe geç
+        if (executionPermission(run) !== "read-only") throw new Error(`Task failed; side effects require reconciliation: ${lastError}`);
       }
     }
-    return `(tüm ajanlar başarısız: ${lastError})`;
+    throw new Error(`All agents failed: ${lastError || "no available agent"}`);
   }
 
   // Bir ajan + (enabled) yedeklerinden oluşan aday zinciri.
@@ -467,15 +469,22 @@ export class Runner {
   }
 
   // Çalışan run'ı durdurur: o anki süreci öldürür, run'ı failed işaretler.
-  stop(runId: string): boolean {
+  async stop(runId: string): Promise<boolean> {
     const control = this.controls.get(runId);
     if (!control) return false;
     control.stop = true;
+    this.store.updateRun(runId, { status: "failed", executionState: "CANCELED", activeStep: "stopped", completedAt: new Date().toISOString(), summary: "Canceled by user. Reconcile side effects before new work." });
+    if (control.discard) { const discard = control.discard; control.approve = undefined; control.discard = undefined; discard(); }
+    for (const controller of control.aborters ?? []) controller.abort();
     // Faz onayı bekliyorsa serbest bırak (durdurma kontrolüne düşsün).
     if (control.resume) { const r = control.resume; control.resume = undefined; r(); }
     // TÜM paralel ajan süreçlerini ANINDA öldür (sadece sonuncuyu değil).
-    for (const child of control.children) killProcessTree(child);
-    control.children.clear();
+    const results = await Promise.allSettled([...control.children].map((child) => killProcessTree(child)));
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure?.status === "rejected") {
+      this.emit(runId, "failed", failure.reason.message);
+      throw failure.reason;
+    }
     this.emit(runId, "agent_step", "🛑 Durduruldu.", null);
     return true;
   }
@@ -486,9 +495,9 @@ export class Runner {
    * user hits Ctrl-C in the terminal).
    * Returns the number of runs that were actively running.
    */
-  stopAll(): number {
+  async stopAll(): Promise<number> {
     const ids = [...this.controls.keys()];
-    for (const id of ids) this.stop(id);
+    await Promise.all(ids.map((id) => this.stop(id)));
     return ids.length;
   }
 
@@ -511,7 +520,6 @@ export class Runner {
     this.emit(run.id, "started", "Run started.");
 
     // Pre-write diff approval: tüm rolleri bir tek staging worktree üzerinde koştur.
-    // Apply sonrası TRANSCRIPT.md workspace'e yazılır; discard sonrası yazılmaz.
     let staging: StagingSession | null = null;
     if (run.preWriteApproval) {
       try {
@@ -521,19 +529,14 @@ export class Runner {
         const message = error instanceof Error ? error.message : String(error);
         this.emit(run.id, "failed", en ? `Staging worktree failed: ${message}` : `Çalışma alanı hazırlanamadı: ${message}`);
         this.store.updateRun(run.id, { status: "failed", activeStep: "failed", completedAt: new Date().toISOString(), summary: message });
-        this.controls.delete(run.id);
+        this.releaseWorkspace(run.id);
         return;
       }
     }
 
     try {
       mkdirSync(run.workspacePath, { recursive: true });
-      await GitService.ensureRepo(run.workspacePath); // proje kendi git deposu olsun (izolasyon)
-      // PROMPT.md'yi staging'e yaz (workspace'e dokunma). Discard edilirse orijinal
-      // workspace saf kalır; apply sonrası staging merge'i zaten PROMPT.md'yi getirir.
       const promptCwd = staging?.worktreePath ?? run.workspacePath;
-      writeFileSync(join(promptCwd, "PROMPT.md"), run.prompt, "utf8");
-      this.emit(run.id, "file_created", "PROMPT.md", null, "PROMPT.md");
 
       const control = this.controls.get(run.id);
       for (const role of flowRoles) {
@@ -543,14 +546,13 @@ export class Runner {
           this.emit(run.id, "failed", enStop ? "Run stopped by the user." : "Çalışma kullanıcı tarafından durduruldu.");
           if (staging) await discardStaging(run.workspacePath, staging).catch(() => undefined);
           this.store.updateRun(run.id, { pendingPhase: null });
-          this.controls.delete(run.id);
+          this.releaseWorkspace(run.id);
           return;
         }
 
         const agent = this.pickAgent(role);
         if (!agent) {
-          this.emit(run.id, "failed", `No enabled agent for role: ${role}`);
-          continue;
+          throw new Error(`No enabled agent for role: ${role}`);
         }
 
         // Adımlar arası: kullanıcının bıraktığı notları topla, bu ajana ilet.
@@ -563,34 +565,30 @@ export class Runner {
       }
 
       if (staging) {
-        // Apply/Discard kararı: TRANSCRIPT.md yazmadan önce bekle.
+        await sealStaging(staging);
+        // Wait for explicit approval of the sealed staging commit.
         this.store.updateRun(run.id, { activeStep: "pending review" });
         this.emit(run.id, "phase_pending_review", en ? "📝 Run complete. Review the pending diff and Apply or Discard." : "📝 Çalışma tamamlandı. Bekleyen değişikliği inceleyin, Uygula veya At.");
-        const decision = await new Promise<"approve" | "discard" | "stop">((resolveD) => {
-          if (!control) return resolveD("approve"); // sunucu yeniden başladıysa otomatik uygula
-          control.approve = () => resolveD("approve");
-          control.discard = () => resolveD("discard");
-        });
+        const decision = await this.waitForApproval(run.id, control);
         if (control) { control.approve = undefined; control.discard = undefined; }
         if (decision === "discard" || control?.stop) {
           await discardStaging(run.workspacePath, staging).catch(() => undefined);
           this.store.updateRun(run.id, { pendingPhase: null });
           this.store.updateRun(run.id, { status: "failed", activeStep: "discarded", completedAt: new Date().toISOString(), summary: en ? "Discarded by user." : "Kullanıcı tarafından atıldı." });
           this.emit(run.id, "failed", en ? "🗑️ Discarded. Run aborted." : "🗑️ Atıldı. Çalışma iptal edildi.");
-          this.controls.delete(run.id);
+          this.releaseWorkspace(run.id);
           return;
         }
         await applyStaging(run.workspacePath, staging);
         this.store.updateRun(run.id, { pendingPhase: null });
       }
 
-      writeFileSync(join(run.workspacePath, "TRANSCRIPT.md"), transcript.join("\n\n"), "utf8");
-      this.emit(run.id, "file_created", "TRANSCRIPT.md", null, "TRANSCRIPT.md");
+      this.emit(run.id, "stdout", transcript.join("\n\n"));
       this.store.updateRun(run.id, {
         status: "completed",
         activeStep: "completed",
         completedAt: new Date().toISOString(),
-        summary: "Run completed. Transcript saved in workspace."
+        summary: "Run completed without independent verification. Transcript retained in execution events."
       });
       this.emit(run.id, "completed", "Run completed.");
     } catch (error) {
@@ -603,7 +601,7 @@ export class Runner {
       });
       this.emit(run.id, "failed", message);
     } finally {
-      this.controls.delete(run.id);
+      this.releaseWorkspace(run.id);
     }
   }
 
@@ -621,6 +619,8 @@ export class Runner {
         return { agent, output: await this.runAgent(agent, run, transcript, notes, opts ? { cwd: opts.cwd } : undefined) };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (this.controls.get(run.id)?.stop) throw new Error("Run canceled");
+        if (executionPermission(run) !== "read-only") throw new Error(`Execution failed; reconcile side effects before retry: ${message}`);
         if (attempt < maxRetries && isTransientRateLimit(message)) {
           const waitMs = 4000 * (attempt + 1);
           this.store.setAgentStatus(agent.id, "available"); // kalıcı limit değil
@@ -636,6 +636,7 @@ export class Runner {
   }
 
   private async fallbackAfterError(agent: Agent, run: Run, transcript: string, notes: string[], opts: { cwd?: string } | undefined, message: string): Promise<{ agent: Agent; output: string }> {
+    if (this.controls.get(run.id)?.stop) throw new Error("Run canceled");
     this.emit(run.id, "failed", message, agent.id);
     for (const fallbackId of agent.fallbackAgentIds) {
       const fallback = this.store.getAgent(fallbackId);
@@ -646,7 +647,15 @@ export class Runner {
     throw new Error(message);
   }
 
-  private runAgent(agent: Agent, run: Run, transcript: string, notes: string[] = [], opts?: { cwd?: string; promptText?: string }) {
+  private async runAgent(agent: Agent, run: Run, transcript: string, notes: string[] = [], opts?: { cwd?: string; promptText?: string }): Promise<string> {
+    try { return await this.runAgentImpl(agent, run, transcript, notes, opts); }
+    finally {
+      if (this.store.getAgent(agent.id)?.status !== "limited") this.store.setAgentStatus(agent.id, "available");
+    }
+  }
+
+  private runAgentImpl(agent: Agent, run: Run, transcript: string, notes: string[] = [], opts?: { cwd?: string; promptText?: string }) {
+    if (this.controls.get(run.id)?.stop) throw new Error("Run canceled");
     const cwd = opts?.cwd ?? run.workspacePath;
     this.store.setAgentStatus(agent.id, "running");
     this.emit(run.id, "started", `${agent.name} started.`, agent.id);
@@ -659,35 +668,14 @@ export class Runner {
       return this.runApiAgent(agent, run, transcript, notes, opts);
     }
 
-    const cleanEnv = { ...process.env };
-    if (agent.command === "claude") {
-      for (const key of Object.keys(cleanEnv)) {
-        const normalized = key.toUpperCase();
-        if (normalized.startsWith("ANTHROPIC_") || normalized.startsWith("CLAUDE_CODE_")) {
-          delete cleanEnv[key];
-        }
-      }
-    }
-    // CLI'lar (özellikle agy) sistem PATH'inde olmayabilir; kendi bin dizinlerini ekle.
-    if (process.platform === "win32") {
-      const home = process.env.USERPROFILE ?? "";
-      const agyBin = join(home, "AppData", "Local", "agy", "bin");
-      const npmDir = join(process.env.APPDATA ?? join(home, "AppData", "Roaming"), "npm");
-      cleanEnv.PATH = [agyBin, npmDir, cleanEnv.PATH ?? cleanEnv.Path].filter(Boolean).join(";");
-    }
-    // GitHub bağlıysa: ajanın `git push/clone/fetch`'i github.com'a kimlikli gitsin diye
-    // tek-seferlik HTTP header'ı GIT_CONFIG env ile geçir (token diske/.git/config'e yazılmaz).
-    if (this.githubToken) {
-      const basic = Buffer.from(`x-access-token:${this.githubToken}`, "utf8").toString("base64");
-      cleanEnv.GIT_CONFIG_COUNT = "1";
-      cleanEnv.GIT_CONFIG_KEY_0 = "http.https://github.com/.extraheader";
-      cleanEnv.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${basic}`;
-    }
+    assertIsolatedWorker();
+    const cleanEnv = agentEnvironment();
+    const args = secureAgentArgs(agent, executionPermission(run));
 
     return new Promise<string>((resolve, reject) => {
-      mkdirSync(cwd, { recursive: true });
-      // agy ajanı: workspace'i önce güvenilir yap (trust prompt'unu atla).
-      if (agent.command === "agy") ensureAgyTrusted(cwd);
+      if (executionPermission(run) === "workspace-write") mkdirSync(cwd, { recursive: true });
+      else if (!existsSync(cwd)) throw new Error("Read-only task folder must already exist");
+
       let lastSnapshot = snapshotWorkspace(cwd);
       const reportFileChanges = () => {
         const nextSnapshot = snapshotWorkspace(cwd);
@@ -702,25 +690,12 @@ export class Runner {
         }
         lastSnapshot = nextSnapshot;
       };
-      const fileWatch = setInterval(reportFileChanges, 1000);
-      let promptText = opts?.promptText ?? buildAgentPrompt(run.prompt, agent, transcript, notes);
-      // GitHub bağlıysa ajana bildir: git push/pull/clone github.com'a kimlikli çalışır.
-      if (this.githubToken) {
-        promptText += "\n\n[GitHub bağlı: git push/pull/fetch/clone github.com için kimlik doğrulamalı. 'origin' ayarlıysa istendiğinde `git push` yapabilirsin.]";
-      }
-      // Prompt'u argüman yerine stdin'den ver: Windows cmd.exe çok satırlı argümanı keser.
-      // {prompt} placeholder'ı args'tan çıkarılır; metin stdin'e yazılır.
-      const templateArgs = agent.argsTemplate.filter((arg) => arg.trim() !== "{prompt}");
-      const args = interpolateArgs(templateArgs, {
-        prompt: promptText,
-        workspace: cwd,
-        transcript,
-        role: agent.role
-      });
+      const promptText = opts?.promptText ?? buildAgentPrompt(run.prompt, agent, transcript, notes);
       const child = spawnCommand(agent.command, args, {
         cwd,
         env: cleanEnv
       });
+      const fileWatch = setInterval(reportFileChanges, 1000);
       try {
         child.stdin?.end(promptText);
       } catch {
@@ -730,9 +705,13 @@ export class Runner {
       if (control) control.children.add(child);
 
       let output = "";
+      let timedOut = false;
       const timeout = setTimeout(() => {
-        child.kill();
-        reject(new Error(`${agent.name} timed out after ${agent.timeoutSeconds}s.`));
+        timedOut = true;
+        void killProcessTree(child).catch((error) => {
+          clearInterval(fileWatch);
+          reject(error);
+        });
       }, agent.timeoutSeconds * 1000);
 
       child.stdout.on("data", (chunk: Buffer) => {
@@ -767,7 +746,13 @@ export class Runner {
         const current = this.store.getAgent(agent.id);
         if (current?.status !== "limited") this.store.setAgentStatus(agent.id, "available");
 
-        if (code === 0) {
+        if (timedOut) {
+          reject(new Error(`${agent.name} timed out after ${agent.timeoutSeconds}s.`));
+        } else if (control?.stop) {
+          reject(new Error("Run canceled"));
+        } else if (code === 0 && structuredFailure(output)) {
+          reject(new Error(structuredFailure(output)));
+        } else if (code === 0) {
           this.emit(run.id, "completed", `${agent.name} completed.`, agent.id);
           resolve(output.trim() || "(no output)");
         } else {
@@ -779,6 +764,7 @@ export class Runner {
 
   private async runDryAgent(agent: Agent, run: Run, transcript: string) {
     await new Promise((resolve) => setTimeout(resolve, 500));
+    if (this.controls.get(run.id)?.stop) throw new Error("Run canceled");
     const output = dryOutput(agent, run.prompt, transcript);
     this.emit(run.id, "stdout", output, agent.id, output);
     this.store.setAgentStatus(agent.id, "available");
@@ -793,17 +779,19 @@ export class Runner {
     const cwd = opts?.cwd ?? run.workspacePath;
     // API modelleri (CLI'ların aksine) dosya sistemine erişemez; sadece metin döndürür.
     // Kodlama rollerinde, çıktıdaki yol-etiketli blokları biz dosyalara yazarız.
-    const writesCode = agent.role === "builder" || agent.role === "fixer" || agent.role === "custom";
+    const writesCode = executionPermission(run) === "workspace-write" && (agent.role === "builder" || agent.role === "fixer" || agent.role === "custom");
     const controller = new AbortController();
+    const control = this.controls.get(run.id);
+    if (control) (control.aborters ??= new Set()).add(controller);
+    if (control?.stop) controller.abort();
     const timeout = setTimeout(() => controller.abort(), agent.timeoutSeconds * 1000);
     let promptText = opts?.promptText ?? buildAgentPrompt(run.prompt, agent, transcript, notes);
     if (writesCode) {
       promptText += "\n\n[DOSYA ÇIKTI KURALI / FILE OUTPUT RULE: API agents can't touch the filesystem, so emit every file you create or modify as a fenced code block whose info line is the file's workspace-relative path, then Orkestra writes it. Output the COMPLETE file. Example:\n```src/index.html\n<full file content>\n```\nUse one block per file. Keep prose minimal.]";
-    } else if (this.githubToken) {
-      promptText += "\n\n[GitHub bağlı: API ajanı doğrudan git komutu çalıştıramaz; uygulanacak değişiklikleri açıkça tarif et.]";
     }
     try {
       const output = await runApiProvider(config, promptText, controller.signal);
+      if (control?.stop) throw new Error("Run canceled");
       const clean = output.trim() || "(no output)";
       this.emit(run.id, "stdout", clean, agent.id, clean);
       if (writesCode) {
@@ -824,6 +812,7 @@ export class Runner {
       if (current?.status !== "limited") this.store.setAgentStatus(agent.id, "available");
       throw new Error(message);
     } finally {
+      control?.aborters?.delete(controller);
       clearTimeout(timeout);
     }
   }
@@ -839,16 +828,15 @@ export class Runner {
       const cand = info.split(/\s+/).filter(Boolean).pop() || "";
       // info satırı bir dosya yolu mu? (uzantı/eğik çizgi içermeli — salt dil etiketi değil)
       if (!cand || !/[./\\]/.test(cand)) continue;
-      const rel = cand.replace(/^[./\\]+/, "").replace(/\\/g, "/");
-      if (!rel || rel.includes("..") || rel.length > 200) continue;
-      try {
-        const full = join(cwd, rel);
+      const rel = cand;
+      const full = containedTaskPath(cwd, rel);
+      {
         mkdirSync(dirname(full), { recursive: true });
         const existed = existsSync(full);
         writeFileSync(full, m[2].replace(/\s+$/, "") + "\n", "utf8");
         this.emit(runId, existed ? "file_changed" : "file_created", rel, null, JSON.stringify({ path: rel, adds: 0, dels: 0 }));
         count++;
-      } catch { /* yoksay */ }
+      }
     }
     return count;
   }
@@ -867,26 +855,6 @@ export class Runner {
     this.store.setAgentStatus(agent.id, "limited", now);
     this.emit(runId, "limit_detected", `${agent.name} limit detected: ${matched}`, agent.id, text);
   }
-}
-
-function spawnCommand(
-  command: string,
-  args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv }
-) {
-  if (process.platform !== "win32") {
-    return spawn(command, args, {
-      ...options,
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-  }
-
-  const commandLine = [command, ...args].map(quoteWindowsShellArg).join(" ");
-  return spawn(commandLine, {
-    ...options,
-    shell: true,
-    stdio: ["pipe", "pipe", "pipe"]
-  });
 }
 
 // Oturum açılmış bir CLI (claude | codex | agy) için, konfigüre ajan olmadan
@@ -918,13 +886,15 @@ function adHocAgent(cli: string, model: string | undefined, role: string): Agent
   // antigravity'nin komutu "agy".
   if (cli === "claude") {
     command = "claude";
-    argsTemplate = m ? ["--model", m, "-p", "--permission-mode", "acceptEdits"] : ["-p", "--permission-mode", "acceptEdits"];
+    argsTemplate = m ? ["--model", m, "-p"] : ["-p"];
   } else if (cli === "codex") {
     command = "codex";
-    argsTemplate = m ? ["exec", "-m", m, "--dangerously-bypass-approvals-and-sandbox"] : ["exec", "--dangerously-bypass-approvals-and-sandbox"];
-  } else if (cli === "antigravity" || cli === "agy" || cli === "gemini") {
-    command = "agy";
-    argsTemplate = m ? ["--model", m, "-p", "--dangerously-skip-permissions"] : ["-p", "--dangerously-skip-permissions"];
+    argsTemplate = m ? ["exec", "-m", m] : ["exec"];
+  } else if (cli === "gemini") {
+    command = "gemini";
+    argsTemplate = m ? ["--model", m, "-p"] : ["-p"];
+  } else if (cli === "antigravity" || cli === "agy") {
+    throw new Error("Antigravity requires a separate restricted adapter");
   } else {
     return undefined;
   }
@@ -972,47 +942,15 @@ function phaseStateFile(workspacePath: string) {
 }
 function savePhaseState(workspacePath: string, state: PhaseState) {
   try {
+    mkdirSync(workspacePath, { recursive: true });
     writeFileSync(phaseStateFile(workspacePath), JSON.stringify(state), "utf8");
   } catch {
     // yazılamazsa sessiz geç (resume canlı promise üzerinden yine çalışır)
   }
 }
-function loadPhaseState(workspacePath: string): PhaseState | null {
-  try {
-    return JSON.parse(readFileSync(phaseStateFile(workspacePath), "utf8")) as PhaseState;
-  } catch {
-    return null;
-  }
-}
-function clearPhaseState(workspacePath: string) {
-  try {
-    unlinkSync(phaseStateFile(workspacePath));
-  } catch {
-    // yoksa sorun değil
-  }
-}
 
 // Süreç AĞACINI öldürür. Windows'ta CLI shell (cmd.exe) altında torun süreç olduğundan
 // child.kill() yetmez; taskkill /T ile tüm ağaç anında sonlandırılır.
-function killProcessTree(child?: ReturnType<typeof spawnCommand>) {
-  if (!child || child.pid == null) return;
-  const pid = child.pid;
-  try {
-    if (process.platform === "win32") {
-      execFile("taskkill", ["/pid", String(pid), "/T", "/F"], () => {});
-    } else {
-      try { process.kill(-pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
-    }
-  } catch {
-    try { child.kill(); } catch { /* zaten bitmiş olabilir */ }
-  }
-}
-
-function quoteWindowsShellArg(value: string) {
-  const text = String(value);
-  if (/^[A-Za-z0-9_./:=@+-]+$/.test(text)) return text;
-  return `"${text.replaceAll('"', '\\"')}"`;
-}
 
 // Kullanıcının dilini tespit edip yanıt/açıklama dilini ona göre dayatır (EN/TR).
 function agentLangDirective(text: string): string {

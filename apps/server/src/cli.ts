@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ChatMessage, CliToolStatus, EffortLevel } from "../../../packages/shared/types";
 import { getModelOptions, getUsageFor } from "./usage";
-import { ensureAgyTrusted } from "./runner";
+import { validatePlan } from "./security";
+import { assertIsolatedWorker, secureAgentArgs } from "./execution-policy";
+import { runCommand } from "./process";
 import { getApiProviderConfig, runApiProvider, type ApiProviderConfig } from "./apiProviders";
 
 const plannerTimeoutMs = 60_000;
@@ -269,6 +271,7 @@ export async function generatePlan(
       const raw = await callPlannerRaw(planner, buildPlanPrompt(history, message, analysis, agentCount), model);
       const tasks = parsePlanTasks(cleanPlannerOutput(raw));
       if (tasks.length) {
+        validatePlan(tasks);
         return { tasks, planner, modelLabel: model && model !== "default" ? `${modelLabel(planner)} · ${model}` : modelLabel(planner) };
       }
     } catch {
@@ -320,27 +323,14 @@ function buildPlanPrompt(history: ChatMessage[], message?: string, analysis?: st
   ].filter(Boolean).join("\n");
 }
 
-function parsePlanTasks(output: string): Array<{ id: string; title: string; role?: string; folder?: string; dependsOn?: string[]; phase?: number }> {
-  // JSON'u metin içinden ayıkla.
+export function parsePlanTasks(output: string): import("../../../packages/shared/types").PlanTask[] {
   const match = output.match(/\{[\s\S]*\}/);
   if (!match) return [];
-  try {
-    const parsed = JSON.parse(match[0]) as { tasks?: any[] };
-    if (!Array.isArray(parsed.tasks)) return [];
-    const allowedRoles = new Set(["planner", "builder", "reviewer", "fixer"]);
-    return parsed.tasks
-      .filter((t) => t && typeof t.title === "string")
-      .map((t, i) => ({
-        id: typeof t.id === "string" && t.id.trim() ? t.id.trim() : `task${i + 1}`,
-        title: String(t.title).trim(),
-        role: allowedRoles.has(t.role) ? t.role : "builder",
-        folder: typeof t.folder === "string" ? t.folder.replace(/[^a-z0-9._/-]/gi, "").slice(0, 60) : "",
-        dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.filter((d: any) => typeof d === "string") : [],
-        phase: Number.isFinite(t.phase) && t.phase >= 1 ? Math.floor(t.phase) : 1
-      }));
-  } catch {
-    return [];
-  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(match[0]); } catch { return []; }
+  const tasks = (parsed as { tasks?: unknown })?.tasks;
+  validatePlan(tasks);
+  return tasks;
 }
 
 export async function getCliStatuses(): Promise<CliToolStatus[]> {
@@ -650,7 +640,6 @@ function neutralAgyCwd() {
   const dir = join(tmpdir(), "orkestra-agy-neutral");
   try {
     mkdirSync(dir, { recursive: true });
-    ensureAgyTrusted(dir); // nötr dizini de güvenilir yap (trust prompt'u atla)
     neutralCwdCache = dir;
     return dir;
   } catch {
@@ -1256,77 +1245,13 @@ function safeJsonParse<T>(value: string): T | undefined {
 }
 
 function runTool(command: string, args: string[], input: string, timeoutMs = plannerTimeoutMs, cwd?: string) {
-  return new Promise<string>((resolve, reject) => {
-    const resolved = resolveTool(command);
-    const executable = resolved.executable;
-    const finalArgs = [...resolved.prefixArgs, ...args];
-
-    const child = execFile(executable, finalArgs, {
-      timeout: timeoutMs,
-      windowsHide: true,
-      maxBuffer: 1024 * 1024 * 5,
-      env: envForTool(command),
-      cwd
-    }, (error, stdout, stderr) => {
-      const output = `${stdout ?? ""}${stderr ? `\n${stderr}` : ""}`.trim();
-      if (error) {
-        const timedOut = error.killed || /timed out/i.test(error.message);
-        reject(new Error(output || (timedOut ? `${command} yanıt vermedi veya zaman aşımına uğradı.` : error.message)));
-        return;
-      }
-      resolve(output);
-    });
-
-    child.stdin?.end(input || undefined);
-  });
+  if (input || args.includes("-p") || args.includes("exec")) {
+    assertIsolatedWorker();
+    args = secureAgentArgs({ command, argsTemplate: args } as import("../../../packages/shared/types").Agent, "read-only");
+  }
+  return runCommand(command, args, input, timeoutMs, cwd);
 }
 
-function envForTool(command: string) {
-  if (command !== "claude") return process.env;
-  const env = { ...process.env };
-  for (const key of Object.keys(env)) {
-    const normalized = key.toUpperCase();
-    if (normalized.startsWith("ANTHROPIC_") || normalized.startsWith("CLAUDE_CODE_")) {
-      delete env[key];
-    }
-  }
-  return env;
-}
-
-function resolveTool(command: string) {
-  if (process.platform !== "win32") {
-    return { executable: command, prefixArgs: [] as string[] };
-  }
-
-  const npmDir = join(process.env.APPDATA ?? join(process.env.USERPROFILE ?? "", "AppData", "Roaming"), "npm");
-  if (command === "claude") {
-    const claudeCmd = join(npmDir, "claude.cmd");
-    if (existsSync(claudeCmd)) return { executable: "cmd.exe", prefixArgs: ["/d", "/s", "/c", "claude"] };
-    const claudeExe = join(npmDir, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
-    if (existsSync(claudeExe)) return { executable: claudeExe, prefixArgs: [] as string[] };
-  }
-  if (command === "codex") {
-    const codexJs = join(npmDir, "node_modules", "@openai", "codex", "bin", "codex.js");
-    if (existsSync(codexJs)) return { executable: "node", prefixArgs: [codexJs] };
-  }
-  if (command === "gemini") {
-    const geminiJs = join(npmDir, "node_modules", "@google", "gemini-cli", "bundle", "gemini.js");
-    if (existsSync(geminiJs)) return { executable: "node", prefixArgs: [geminiJs] };
-  }
-  if (command === "agy") {
-    const agyExe = agyExecutablePath();
-    if (agyExe) return { executable: agyExe, prefixArgs: [] as string[] };
-    const agyBin = join(userHome(), "AppData", "Local", "agy", "bin");
-    if (existsSync(agyBin)) {
-      return { executable: "cmd.exe", prefixArgs: ["/d", "/s", "/c", `set "PATH=${agyBin};%PATH%" && agy`] };
-    }
-    const agyCmd = join(npmDir, "agy.cmd");
-    if (existsSync(agyCmd)) return { executable: "cmd.exe", prefixArgs: ["/d", "/s", "/c", agyCmd] };
-    return { executable: "cmd.exe", prefixArgs: ["/d", "/s", "/c", "agy"] };
-  }
-
-  return { executable: command, prefixArgs: [] as string[] };
-}
 function formatHistory(history: ChatMessage[]) {
   return history
     .map((item) => {
